@@ -6,8 +6,8 @@ name: arm64 image (Oracle VM)
 # CPU/memory-hungry — Cloud Build runs it on E2_HIGHCPU_8 — and the VM has 2 shared cores that also
 # serve panfleto. The VM only PULLS `ghcr.io/danybgoode/medusa-web:<sha>`; a rollback is a restart.
 #
-# Same Dockerfile, same context and no build args, exactly as cloudbuild.yaml builds it. Cloud Build
-# keeps deploying Cloud Run from the same push until the cutover (S2); this workflow deploys nothing.
+# Same Dockerfile, same context and no build args, exactly as cloudbuild.yaml builds it. Since the
+# 2026-10-16 cutover this is the ONLY production build; it deploys nothing (the VM's update.sh pulls `:main`).
 
 on:
   push:
