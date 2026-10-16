@@ -42,9 +42,11 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
+          # The moving `:main` tag is what the VM's update.sh resolves, so ONLY a build of refs/heads/main may
+          # move it — a manual dispatch from a feature branch gets its sha tag and nothing else.
           tags: |
             ghcr.io/danybgoode/medusa-web:${{ github.sha }}
-            ghcr.io/danybgoode/medusa-web:main
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/danybgoode/medusa-web:main' || '' }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
