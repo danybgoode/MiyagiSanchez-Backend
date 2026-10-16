@@ -1,0 +1,54 @@
+name: arm64 image (Oracle VM)
+
+# miyagi-to-oracle-vm S1.2 — the production image for the Oracle A1 VM (`panfleto-prod`, aarch64).
+#
+# Built HERE, on a native arm64 runner, never on the VM: `medusa build` (the admin bundle especially) is
+# CPU/memory-hungry — Cloud Build runs it on E2_HIGHCPU_8 — and the VM has 2 shared cores that also
+# serve panfleto. The VM only PULLS `ghcr.io/danybgoode/medusa-web:<sha>`; a rollback is a restart.
+#
+# Same Dockerfile, same context and no build args, exactly as cloudbuild.yaml builds it. Cloud Build
+# keeps deploying Cloud Run from the same push until the cutover (S2); this workflow deploys nothing.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-arm64
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + push linux/arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          # The moving `:main` tag is what the VM's update.sh resolves, so ONLY a build of refs/heads/main may
+          # move it — a manual dispatch from a feature branch gets its sha tag and nothing else.
+          tags: |
+            ghcr.io/danybgoode/medusa-web:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/danybgoode/medusa-web:main' || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=medusa-web-arm64
+          cache-to: type=gha,scope=medusa-web-arm64,mode=max
