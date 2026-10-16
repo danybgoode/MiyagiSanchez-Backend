@@ -6,8 +6,9 @@
 # and this workflow deliberately never touches them (see `.github/dependabot.yml`'s ignore block for the
 # React-family majors that are broken BY DESIGN in this repo).
 #
-# ⚠️ A merge to main builds the Medusa image and deploys it to Cloud Run (see cloudbuild.yaml). So this
-# workflow ships to production unattended. That is the accepted trade, made explicitly by the product
+# ⚠️ A merge to main builds the Medusa image (image-arm64.yml). Until 2026-10-16 it also deployed to Cloud Run
+# unattended; on the Oracle VM a merged bump ships at the NEXT `infra/oci/update.sh` run, bundled with whatever
+# else merged since. So this workflow still ships to production without a human reading the bump. That is the accepted trade, made explicitly by the product
 # owner on 2026-08-24, and it is safe only because `main` requires the "Type-check + build + unit" check
 # — the one that actually catches a broken dependency tree. `--auto` QUEUES the merge; GitHub holds it
 # until that required check passes and drops it if the check fails. It never bypasses the gate.

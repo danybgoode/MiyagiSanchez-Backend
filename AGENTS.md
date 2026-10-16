@@ -18,7 +18,11 @@ src/
 ├── subscribers/  ← event handlers    jobs/ ← scheduled     lib/ ← shared logic (flags, clients)
 ```
 
-**Deploy:** merging to `main` builds on Cloud Build (us-east4) → Cloud Run `medusa-web`, **~12 min**.
+**Deploy:** production runs on the Oracle VM `panfleto-prod` (epic `miyagi-to-oracle-vm`, cut over 2026-10-16; the
+Cloud Build → Cloud Run rail is **deleted**). Merging to `main` builds `ghcr.io/danybgoode/medusa-web:main` on an arm64
+runner (`.github/workflows/image-arm64.yml`) and **deploys nothing by itself**: once that build is green, run
+`ssh ubuntu@159.54.158.4 /opt/miyagi/infra/oci/update.sh` (root repo `infra/oci/`). It resolves `:main` to a
+digest, runs migrations on boot, and a `MEDUSA_PIN` line in `.env` rolls back. `cloudbuild.yaml` is no longer deployed.
 There is **no per-branch preview** — this repo can only be verified post-merge against production.
 Say that split in every PR: the agent owns API-level prod smoke, Daniel owns the seller/browser parts.
 
