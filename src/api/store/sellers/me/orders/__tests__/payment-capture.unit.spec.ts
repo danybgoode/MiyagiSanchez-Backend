@@ -2,7 +2,7 @@ import { normalizeMedusaOrder } from '../route'
 
 /**
  * `payment_captured` — the honest "did the money actually land?" answer
- * (miyagisanchezcommerce#298, fresh-reviewer finding).
+ * (MiyagiSanchez-Storefront#298, fresh-reviewer finding).
  *
  * The bug this guards against is subtle and was live: `status` is NOT an assertion of
  * capture. It initialises to 'paid' and is only demoted for cancel/refund/return or an
