@@ -5,8 +5,7 @@ name: arm64 image (Oracle VM)
 # Built HERE, on a native arm64 runner, never on the VM: `medusa build` (the admin bundle especially) is
 # CPU/memory-hungry — Cloud Build runs it on E2_HIGHCPU_8 — and the VM has 2 shared cores that also
 # serve panfleto. The VM only PULLS `ghcr.io/danybgoode/miyagisanchez-backend:<sha>`; a rollback is a restart.
-# (`medusa-web` until the 2026-10-28 rename; still pushed under that name for one deploy, so a VM on the
-# old update.sh keeps working. Drop the old tags once the VM pulls the new name.)
+# (`medusa-web` until the 2026-10-28 rename.)
 #
 # Same Dockerfile, same context and no build args, exactly as cloudbuild.yaml builds it. Since the
 # 2026-10-16 cutover this is the ONLY production build; it deploys nothing (the VM's update.sh pulls `:main`).
@@ -49,8 +48,6 @@ jobs:
           tags: |
             ghcr.io/danybgoode/miyagisanchez-backend:${{ github.sha }}
             ${{ github.ref == 'refs/heads/main' && 'ghcr.io/danybgoode/miyagisanchez-backend:main' || '' }}
-            ghcr.io/danybgoode/medusa-web:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/danybgoode/medusa-web:main' || '' }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
