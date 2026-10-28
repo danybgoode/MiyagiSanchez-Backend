@@ -28,12 +28,10 @@ jobs:
             exit 0
           fi
 
+          # sed, not ${s//&/&amp;}: this runner's bash 5.2 reads `&` in a pattern REPLACEMENT as the matched
+          # text, so the old form turned "<b>" into "<lt;b>gt;" and broke Telegram's HTML.
           esc() {
-            local s="${1:-}"
-            s="${s//&/&amp;}"
-            s="${s//</&lt;}"
-            s="${s//>/&gt;}"
-            printf '%s' "$s"
+            printf '%s' "${1:-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
           }
 
           short_sha="${GITHUB_SHA:0:7}"
