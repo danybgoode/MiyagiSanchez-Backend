@@ -48,5 +48,5 @@ Open the admin dashboard at `localhost:9000/app`. Needs a Postgres `DATABASE_URL
 MercadoPago credentials, and `CLERK_SECRET_KEY` (validates the frontend's JWTs) — see the full env
 list in the frontend repo's `AGENTS.md`.
 
-Other scripts: `npm run build` (`medusa build`), `npm run test:unit`, `npm run
-test:integration:http` / `test:integration:modules` (need Postgres).
+Other scripts: `npm run build` (`medusa build`), `npm run test:unit`, `npm run test:unit:coverage`, and
+`npm run test:integration:http` (needs Postgres).
