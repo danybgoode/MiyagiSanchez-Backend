@@ -1,51 +1,45 @@
-# medusa-bonsai-backend
+# MiyagiSanchez-Backend
 
-The [Medusa v2](https://docs.medusajs.com) commerce engine for
-[Miyagi Sánchez](https://miyagisanchez.com) — a multi-seller marketplace where anyone in Mexico
-can open a shop and sell with no commission, across the marketplace, their own domain, an
-embeddable widget, or to AI shopping agents. This repo owns **every commerce primitive**:
-products, orders, cart/checkout, payments, fulfillment, returns, regions, and the custom modules
-that extend Medusa for this marketplace.
+**[Miyagi Sánchez](https://miyagisanchez.com) is the marketplace where anyone in Mexico can open a shop
+in minutes and sell with no commission.** This repository is its commerce engine: the part that makes
+every sale add up, so sellers can trust their numbers and buyers can trust their orders.
 
-This repo is part of a four-repo platform; the product roadmap and cross-repo practice live in the
-root docs repo, [`miyagi-product-management`](https://github.com/danybgoode/miyagi-product-management).
+## What it makes possible
 
-## What this repo owns
+- **Many sellers, one marketplace.** Every shop has its own catalog, orders, payouts and settings,
+  side by side and kept apart.
+- **Get paid directly, with no commission.** Card through the seller's own Stripe account, Mercado Pago,
+  SPEI bank transfer, cash on delivery, or a payment arranged with the buyer — the money goes to the
+  seller, not through us.
+- **More than products.** Services, rentals, digital goods, subscriptions and event tickets, each with
+  the checkout it needs.
+- **Delivery that matches the order.** Hand delivery and pickup, Correos de México, carriers and
+  shipping quotes.
+- **Profit, not just revenue.** Every sale records its costs, so a seller sees what they actually
+  earned.
+- **Bring your catalog with you.** Import a catalog from a file or sync with Mercado Libre, orders
+  included.
+- **Returns and refunds** that follow how the buyer paid.
+- **Ready for AI shopping assistants.** The same catalog and checkout that serve people serve the AI
+  agents shopping on their behalf.
 
-Custom modules under `src/modules/`, on top of the standard Medusa commerce modules:
+## Who it serves
 
-- `seller` — shops/sellers/vendors (not `@medusajs/marketplace` — no such plugin is used)
-- `subscriptions` — recurring seller offerings
-- `profit` — the per-sale margin ledger ("Ganancias")
-- `mercadolibre` — Mercado Libre catalog/order sync
-- `fulfillment-envia` — Envía.com shipping (Estafeta live)
-- `auth-clerk` — validates the frontend's Clerk JWTs so Medusa can identify customers
-- Payment providers: `payment-stripe-connect`, `payment-mercadopago`, `payment-spei`,
-  `payment-manual`, `payment-manual-mx`, `payment-cash`
+The Mexican micro-merchant who sells by WhatsApp, Instagram or in person and wants a real shop without
+a monthly fee or a cut of every sale — and the buyers who want to support them. A US marketplace
+brings the same shops to buyers in the United States, priced in dollars.
 
-## Practice
+## The Miyagi Sánchez repositories
 
-Follows the same gitflow, risk-tiered PR review, and deterministic-gate discipline as the rest of
-the platform — see [`Roadmap/WAYS-OF-WORKING.md`](https://github.com/danybgoode/miyagi-product-management/blob/main/Roadmap/WAYS-OF-WORKING.md)
-in the root repo. This repo's own deterministic gate is `medusa build` (which also generates the
-`.medusa/types` that `tsc` needs) → `tsc --noEmit` → `npm run test:unit`, required on every PR.
+| Repository | What it is |
+|---|---|
+| [MiyagiSanchez-Storefront](https://github.com/danybgoode/MiyagiSanchez-Storefront) | The marketplace, every shop and the seller dashboard |
+| **MiyagiSanchez-Backend** (this one) | The commerce engine: catalog, orders and payments |
+| [MiyagiSanchez-Product](https://github.com/danybgoode/MiyagiSanchez-Product) | The product roadmap and how we build |
 
-## Deploy
+---
 
-Merging to `main` deploys: Cloud Build (us-east4) → Cloud Run `medusa-web`, ~12 min. There is no
-per-branch preview here — live confirmation happens post-merge against production.
+Visit **[miyagisanchez.com](https://miyagisanchez.com)** · Open your shop at
+**[miyagisanchez.com/mx/vende](https://miyagisanchez.com/mx/vende)**
 
-## Quickstart
-
-```bash
-npm install
-npx medusa db:migrate
-npm run dev   # medusa develop, :9000
-```
-
-Open the admin dashboard at `localhost:9000/app`. Needs a Postgres `DATABASE_URL`, Stripe /
-MercadoPago credentials, and `CLERK_SECRET_KEY` (validates the frontend's JWTs) — see the full env
-list in the frontend repo's `AGENTS.md`.
-
-Other scripts: `npm run build` (`medusa build`), `npm run test:unit`, `npm run
-test:integration:http` / `test:integration:modules` (need Postgres).
+*Contributing? Start with [`AGENTS.md`](AGENTS.md) · local setup: [`DEVELOPING.md`](DEVELOPING.md).*

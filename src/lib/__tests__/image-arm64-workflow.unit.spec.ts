@@ -35,7 +35,7 @@ describe('image-arm64.yml', () => {
   })
 
   it('pushes an immutable per-commit tag the VM can pin', () => {
-    expect(steps).toMatch(/ghcr\.io\/danybgoode\/medusa-web:\$\{\{ github\.sha \}\}/)
+    expect(steps).toMatch(/ghcr\.io\/danybgoode\/miyagisanchez-backend:\$\{\{ github\.sha \}\}/)
   })
 
   it('deploys nothing — Cloud Build owns Cloud Run until the cutover', () => {

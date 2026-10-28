@@ -350,7 +350,7 @@ export function normalizeMedusaOrder(
     payment_received: metadata.payment_received === true,
     // Raw Medusa payment state + the derived "money actually landed" answer.
     //
-    // WHY THIS IS EXPOSED (miyagisanchezcommerce#298, fresh-reviewer finding): `status`
+    // WHY THIS IS EXPOSED (MiyagiSanchez-Storefront#298, fresh-reviewer finding): `status`
     // above is NOT an assertion that payment was captured. It initialises to 'paid' and
     // is only demoted for cancel/refund/return or a MANUAL method that is not yet
     // captured — so a card/MercadoPago order sitting at `payment_status: 'authorized'`

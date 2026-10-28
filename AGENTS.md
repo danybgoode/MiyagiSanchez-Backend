@@ -1,4 +1,4 @@
-# Agent index — medusa-bonsai-backend (the commerce engine)
+# Agent index — MiyagiSanchez-Backend (the commerce engine)
 
 > **Read this before touching anything here.** Auto-loaded by Codex and (via `CLAUDE.md`) by Claude.
 > Keep it SHORT — a file long enough to skim is a file nobody reads twice.
@@ -19,7 +19,7 @@ src/
 ```
 
 **Deploy:** production runs on the Oracle VM `panfleto-prod` (epic `miyagi-to-oracle-vm`, cut over 2026-10-16; the
-Cloud Build → Cloud Run rail is **deleted**). Merging to `main` builds `ghcr.io/danybgoode/medusa-web:main` on an arm64
+Cloud Build → Cloud Run rail is **deleted**). Merging to `main` builds `ghcr.io/danybgoode/miyagisanchez-backend:main` on an arm64
 runner (`.github/workflows/image-arm64.yml`) and **deploys nothing by itself**: once that build is green, run
 `ssh ubuntu@159.54.158.4 /opt/miyagi/infra/oci/update.sh` (root repo `infra/oci/`). It resolves `:main` to a
 digest, runs migrations on boot, and a `MEDUSA_PIN` line in `.env` rolls back. `cloudbuild.yaml` is no longer deployed.

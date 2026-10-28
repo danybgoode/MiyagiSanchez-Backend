@@ -28,12 +28,10 @@ jobs:
             exit 0
           fi
 
+          # sed, not ${s//&/&amp;}: this runner's bash 5.2 reads `&` in a pattern REPLACEMENT as the matched
+          # text, so the old form turned "<b>" into "<lt;b>gt;" and broke Telegram's HTML.
           esc() {
-            local s="${1:-}"
-            s="${s//&/&amp;}"
-            s="${s//</&lt;}"
-            s="${s//>/&gt;}"
-            printf '%s' "$s"
+            printf '%s' "${1:-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
           }
 
           short_sha="${GITHUB_SHA:0:7}"
@@ -43,12 +41,34 @@ jobs:
           fi
           commit_url="${HEAD_COMMIT_URL:-https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}}"
 
-          message="$(printf '<b>%s</b> · 📦 · <code>%s</code>\n%s\nAuthor: <code>%s</code>\n<a href="%s">View commit diff</a>' \
-            "$(esc "$REPOSITORY_NAME")" \
-            "$(esc "$short_sha")" \
-            "$(esc "$commit_header")" \
-            "$(esc "@$ACTOR_HANDLE")" \
-            "$(esc "$commit_url")")"
+          # The commit's first plain paragraph — the "what changed" a merge is written to carry. Skips the
+          # subject, GitHub's squash list ("* …" lines) and trailers. The VM's deploy ping (infra/oci/update.sh
+          # in MiyagiSanchez-Product) reads the SAME paragraph with the same rule, so 📦 and 🚀 read as a pair.
+          prose="$(printf '%s\n' "${HEAD_COMMIT_MESSAGE:-}" | awk '
+            NR == 1 { next }
+            /^[[:space:]]*$/ { if (p != "") { print p; done = 1; exit } skip = 0; next }
+            skip { next }
+            p == "" && ($0 ~ /^[*-] / || $0 ~ /^(Co-Authored-By|Claude-Session|Signed-off-by):/) { skip = 1; next }
+            { sub(/^[[:space:]]+/, ""); p = (p == "" ? $0 : p " " $0) }
+            END { if (!done && p != "") print p }')"
+          if [ "${#prose}" -gt 600 ]; then prose="${prose:0:600}"; prose="${prose% *}…"; fi
+
+          # "(#441)" at the end of a squash subject → a link to the PR.
+          pr_number="$(printf '%s' "$commit_header" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')"
+          pr_part=""
+          if [ -n "$pr_number" ]; then
+            pr_part=" · <a href=\"https://github.com/${GITHUB_REPOSITORY}/pull/${pr_number}\">PR #${pr_number}</a>"
+          fi
+
+          message="<b>$(esc "$REPOSITORY_NAME")</b> · 📦 · <code>$(esc "$short_sha")</code>
+          $(esc "$commit_header")"
+          if [ -n "$prose" ]; then
+            message="${message}
+          $(esc "$prose")"
+          fi
+          message="${message}
+          Author: <code>$(esc "@$ACTOR_HANDLE")</code>${pr_part}
+          <a href=\"$(esc "$commit_url")\">View commit diff</a>"
 
           curl --silent --connect-timeout 5 --max-time 10 \
             --request POST \
