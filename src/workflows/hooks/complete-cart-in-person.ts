@@ -13,7 +13,7 @@ import { completeCartWorkflow } from '@medusajs/medusa/core-flows'
 import { MedusaError } from '@medusajs/framework/utils'
 import { IN_PERSON_MODULE } from '../../modules/in-person'
 import { counterCartMatchesClaim, disallowedCounterProviders } from '../../lib/in-person-sale'
-import { LINK_HASH_KIND } from '../../lib/payment-link-cart'
+import { LINK_HASH_KIND, cartHoldsLink } from '../../lib/payment-link-cart'
 import { derivePaymentLinkState } from '../../lib/payment-link'
 import { SELLER_MODULE } from '../../modules/seller'
 import { resolveSellerMpToken } from '../../api/store/_utils/mp'
@@ -61,6 +61,12 @@ async function validatePaymentLinkCart(container: any, inPerson: any, cart: any,
     const p = String(s.provider_id)
     if (p === 'pp_manual_manual') {
       if (!open) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment link is closed.')
+      // A single-use link: only the cart holding it may complete on the manual provider
+      // (which authorizes unconditionally) — otherwise two carts could both become
+      // orders of one single-use link (codex, PR 221 round 2).
+      if (link.uses === 'single' && !cartHoldsLink(link, cartId, new Date())) {
+        throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'Another checkout holds this payment link.')
+      }
       continue
     }
     if (p === 'pp_stripe-connect_stripe-connect') continue // the provider proves Stripe paid THIS session (stripe-authorization.ts)

@@ -508,6 +508,14 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         const cart = await buildPaymentLinkCart(container as any, made.body.token)
         if (!cart.ok) throw new Error(`${cart.code}: ${cart.message}`)
         expect(cart.body.total_cents).toBe(80000)
+        // A second opener's cart may NOT complete on the manual provider: only the cart
+        // holding the single-use link may (codex, PR 221 round 2).
+        const rival = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!rival.ok) throw new Error(rival.code)
+        expect(await holdSingleUseLink(container as any, made.body.id, cart.body.cart_id, 60_000)).toBe(true)
+        let refused: string | null = null
+        try { await payOnManual(container, rival.body.cart_id) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/Another checkout holds this payment link/)
         const orderId = await payOnManual(container, cart.body.cart_id)
         expect(orderId).toBeTruthy()
         // The order is the seller's (its line is on a product the seller owns).

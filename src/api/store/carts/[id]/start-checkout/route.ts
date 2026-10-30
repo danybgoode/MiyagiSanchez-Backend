@@ -21,7 +21,7 @@ import { SELLER_MODULE } from '../../../../../modules/seller'
 import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
 import { CHECKOUT_OPEN_STALE_MS, expireCounterCheckout } from '../../../../../lib/in-person-sale-status'
 import { counterCartMatchesClaim } from '../../../../../lib/in-person-sale'
-import { LINK_HASH_KIND, closedRefusal, holdSingleUseLink, linkCartFor } from '../../../../../lib/payment-link-cart'
+import { LINK_HASH_KIND, claimLinkCartCheckout, closedRefusal, holdSingleUseLink, linkCartFor } from '../../../../../lib/payment-link-cart'
 import { derivePaymentLinkState } from '../../../../../lib/payment-link'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
@@ -526,6 +526,13 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // also get below), so an abandoned attempt frees the link by itself.
     if (lk.uses === 'single' && !(await holdSingleUseLink(req.scope, lk.id, cartId, COUNTER_CHECKOUT_TTL_MS))) {
       return res.status(409).json({ code: 'LINK_BUSY', message: 'Alguien está pagando este cobro. Intenta de nuevo en unos minutos.' })
+    }
+    // ONE checkout per link cart, ever — taken atomically. Two concurrent start-checkout
+    // calls for the same cart both passed the collection check and could open two
+    // provider checkouts (codex security lens, PR 221). A link cart is disposable: the
+    // pay page builds a fresh one for every new attempt.
+    if (!(await claimLinkCartCheckout(req.scope, cartId))) {
+      return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
     }
     body.fulfillment_method = lk?.kind === 'amount' ? 'digital' : 'local_pickup'
   }

@@ -265,3 +265,23 @@ export async function recordLinkOrder(scope: Scope, orderId: string): Promise<vo
     [orderId, orderId, moneyIsReal, lc.payment_link_id],
   )
 }
+
+/** Take a link cart's one-and-only checkout. True only for the first caller. */
+export async function claimLinkCartCheckout(scope: Scope, cartId: string): Promise<boolean> {
+  const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  const r = await knex.raw(
+    `update payment_link_cart
+        set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_started_at', now()::text),
+            updated_at = now()
+      where cart_id = ? and (metadata->>'checkout_started_at') is null
+      returning id`,
+    [cartId],
+  )
+  return (r?.rows?.length ?? 0) > 0
+}
+
+/** Does `cartId` hold its single-use link right now? */
+export function cartHoldsLink(link: { metadata?: any }, cartId: string, now: Date): boolean {
+  const m = link?.metadata ?? {}
+  return m.hold_cart_id === cartId && typeof m.hold_until === 'string' && new Date(m.hold_until).getTime() > now.getTime()
+}
