@@ -497,6 +497,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     )) {
       return res.status(409).json({ code: 'CART_CHANGED', message: 'Este cobro cambió. Vuelve a abrir el link.' })
     }
+    if (supportCheckout) {
+      return res.status(422).json({ code: 'LINK_PROVIDER_MISMATCH', message: 'Este método de pago no corresponde a este cobro.' })
+    }
     // The money goes to the LINK's seller; nothing a buyer sends can redirect it.
     body.seller_id = String(linkCart.seller_id)
     body.shipping_quote = undefined
@@ -591,6 +594,16 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // (`openCounterCheckout` + `fenceCounterCheckout` below): marking here let any
     // validation failure afterwards wedge the slot, and a stalled request could create a
     // payable QR after a cancel (codex, PR 218).
+  }
+  if (!serverCartSource) {
+    // The seller's hidden «Cobro libre» product (D14) is payable ONLY through a link,
+    // at the link's price — never added to an ordinary cart at its $10 base price
+    // (verifier, PR 221).
+    const ids = Array.from(new Set((cart.items ?? []).map((i: any) => i.product_id).filter(Boolean))) as string[]
+    const rows = ids.length ? await loadProductsForCheckout(remoteQuery as any, ids) : []
+    if ((rows as any[]).some((p) => (p?.metadata as any)?.is_payment_link_product === true)) {
+      return res.status(422).json({ code: 'LINK_PRODUCT_NOT_BUYABLE', message: 'Este producto solo se paga con su link de cobro.' })
+    }
   }
   const isCounterCart = serverCartSource === 'in_person'
   // Payment links (S4) will resolve their id from their own table, like the claim above.

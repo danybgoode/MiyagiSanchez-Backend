@@ -222,3 +222,46 @@ export async function holdSingleUseLink(scope: Scope, linkId: string, cartId: st
   )
   return (r?.rows?.length ?? 0) > 0
 }
+
+/**
+ * Record an order on the payment link it was paid through, if any (D13: "the order's
+ * payment drives `paid`").
+ *
+ * Called on `order.placed` and again when the seller confirms a «Pago directo» order.
+ * The order's id is always appended (idempotently) so the seller sees it. A SINGLE-use
+ * link is closed only once the money is real: a processor-confirmed card payment, or a
+ * manual payment the seller confirmed. A manual order that is merely pending must not
+ * close the link — anyone holding the token could otherwise close it for free (verifier,
+ * PR 221). The status write is conditional on `pending`, so a seller's cancel is never
+ * overwritten.
+ */
+export async function recordLinkOrder(scope: Scope, orderId: string): Promise<void> {
+  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data: oc } = await query.graph({ entity: 'order_cart', fields: ['cart_id'], filters: { order_id: orderId } })
+  const cartId = (oc?.[0] as any)?.cart_id
+  if (!cartId) return
+  const [lc] = await scope.resolve(IN_PERSON_MODULE).listPaymentLinkCarts({ cart_id: cartId }, { take: 1 })
+  if (!lc) return
+  const { data } = await query.graph({
+    entity: 'order',
+    fields: ['id', 'metadata', 'payment_collections.payments.provider_id', 'payment_collections.payments.captured_at'],
+    filters: { id: orderId },
+  })
+  const order = data?.[0] as any
+  const payment = (order?.payment_collections ?? []).flatMap((pc: any) => pc?.payments ?? [])[0]
+  const provider = String(payment?.provider_id ?? '')
+  const moneyIsReal = provider === 'pp_stripe-connect_stripe-connect' || provider === 'pp_mercadopago_mercadopago'
+    || Boolean(payment?.captured_at) || order?.metadata?.payment_received === true
+  const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  await knex.raw(
+    `update payment_link
+        set paid_order_ids = case
+              when coalesce(paid_order_ids, '[]'::jsonb) @> to_jsonb(?::text) then paid_order_ids
+              else coalesce(paid_order_ids, '[]'::jsonb) || to_jsonb(?::text)
+            end,
+            status = case when ? and uses = 'single' and status = 'pending' then 'paid' else status end,
+            updated_at = now()
+      where id = ?`,
+    [orderId, orderId, moneyIsReal, lc.payment_link_id],
+  )
+}

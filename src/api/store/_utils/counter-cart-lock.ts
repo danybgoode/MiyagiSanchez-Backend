@@ -30,7 +30,7 @@ export async function refuseCounterCartMutation(req: MedusaRequest, res: MedusaR
     // Payment-link carts (S4) are server-owned the same way.
     const [linkCart] = claim ? [null] : await inPerson.listPaymentLinkCarts({ cart_id: cartId }, { take: 1 })
     if (!claim && !linkCart) return next()
-    return res.status(409).json({ code: 'COUNTER_CART_LOCKED', message: 'Esta venta en persona no se puede modificar.' })
+    return res.status(409).json({ code: 'COUNTER_CART_LOCKED', message: 'Este cobro no se puede modificar.' })
   } catch (e) {
     // Fail CLOSED: if we cannot tell whether this is a counter cart, a mutation waits.
     console.error('[counter-cart-lock] lookup failed', (e as Error)?.message)
