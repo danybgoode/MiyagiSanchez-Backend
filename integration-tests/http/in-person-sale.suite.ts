@@ -139,12 +139,15 @@ export function inPersonSaleSuite(getContainer: () => any) {
         const query = container.resolve(ContainerRegistrationKeys.QUERY)
         const { data } = await query.graph({
           entity: 'order',
-          fields: ['id', 'sales_channel_id', 'customer_id', 'metadata', 'payment_collections.payments.captured_at'],
+          fields: ['id', 'sales_channel_id', 'customer.has_account', 'customer.metadata', 'metadata', 'payment_collections.payments.captured_at'],
           filters: { id: r.body.order_id },
         })
         const order = data[0] as any
         expect(order.sales_channel_id).toBe(channelId)
-        expect(order.customer_id ?? null).toBeNull()
+        // D6 (as built): Medusa's cart creates a GUEST customer from the email, exactly as
+        // every guest checkout does. What must never exist is an account or a Clerk link.
+        expect(order.customer?.has_account ?? false).toBe(false)
+        expect(order.customer?.metadata?.clerk_user_id ?? null).toBeNull()
         expect(order.metadata.source).toBe('in_person')
         expect(order.metadata.payment_method).toBe('cash')
         expect(order.metadata.payment_received).toBe(true)
