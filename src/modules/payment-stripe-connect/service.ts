@@ -177,8 +177,11 @@ export class StripeConnectProviderService extends AbstractPaymentProvider<Option
 
     try {
       const session = await this.stripe_.checkout.sessions.retrieve(sessionId, {}, requestContextFor(data).options)
-      const decision = decideStripeAuthorization(session as any, (input.context as any)?.idempotency_key)
-      if (decision === 'refused') return { status: 'error' as PaymentSessionStatus }
+      // Status is informational (no Medusa path calls it; authorizePayment is the gate),
+      // and callers pass no payment-session id — so only a PRESENT id that disagrees with
+      // the binding is refused here (verifier, PR 219).
+      const key = (input.context as any)?.idempotency_key as string | undefined
+      if (key && decideStripeAuthorization(session as any, key) === 'refused') return { status: 'error' as PaymentSessionStatus }
       if (session.payment_status === 'paid') return { status: 'captured' as PaymentSessionStatus }
       if (session.status === 'expired') return { status: 'canceled' as PaymentSessionStatus }
       return { status: 'pending' as PaymentSessionStatus }
