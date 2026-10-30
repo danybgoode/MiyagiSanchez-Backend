@@ -452,6 +452,14 @@ export async function recordInPersonSale(
     // Transient: release the claim (stale now) so an immediate retry takes it over
     // and resumes the recorded cart instead of waiting out the stale window.
     await releaseClaim(scope, claimId, token).catch(() => {})
-    throw e
+    // Answered, never re-thrown: Medusa's error handler maps a thrown error by its
+    // type (NOT_ALLOWED/INVALID_DATA → 400, CONFLICT → 409), and a 4xx after the claim
+    // reads to a client as "this sale was refused, start over" — which, after an order
+    // may already exist (a capture that failed post-completion), is a double sale. One
+    // explicit code says the only safe thing: resend THIS client_id (verifier, #458).
+    console.error('[in-person] post-claim failure — client must resend the same client_id', {
+      claimId, message: (e as Error)?.message,
+    })
+    return refuse(503, 'RETRY_SAME_ID', 'No se pudo terminar de registrar la venta. Toca «Reintentar»: no se cobra doble.')
   }
 }
