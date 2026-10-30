@@ -279,13 +279,18 @@ export async function recordLinkOrder(scope: Scope, orderId: string): Promise<vo
   } else {
     // A canceled order is neither payment nor pending: drop it from the pending list so the
     // link reopens (the seller cancelled an unpaid transfer in Pedidos).
+    // …and release the link's hold if THIS order's cart held it, so the next buyer is
+    // not told LINK_BUSY for the rest of the checkout TTL (codex, PR 221 round 6).
     await knex.raw(
       `update payment_link
-          set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{pending_order_ids}',
-                coalesce(metadata->'pending_order_ids', '[]'::jsonb) - ?::text),
+          set metadata = (case when metadata->>'hold_cart_id' = ?
+                               then coalesce(metadata, '{}'::jsonb) - 'hold_cart_id' - 'hold_until'
+                               else coalesce(metadata, '{}'::jsonb) end)
+                         || jsonb_build_object('pending_order_ids',
+                              coalesce(metadata->'pending_order_ids', '[]'::jsonb) - ?::text),
               updated_at = now()
         where id = ?`,
-      [orderId, lc.payment_link_id],
+      [cartId, orderId, lc.payment_link_id],
     )
   }
 }

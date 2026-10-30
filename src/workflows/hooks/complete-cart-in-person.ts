@@ -10,7 +10,7 @@
  * existing at all. A cart with no counter claim is untouched.
  */
 import { completeCartWorkflow } from '@medusajs/medusa/core-flows'
-import { MedusaError } from '@medusajs/framework/utils'
+import { ContainerRegistrationKeys, MedusaError } from '@medusajs/framework/utils'
 import { IN_PERSON_MODULE } from '../../modules/in-person'
 import { counterCartMatchesClaim, disallowedCounterProviders } from '../../lib/in-person-sale'
 import { LINK_HASH_KIND, cartHoldsLink } from '../../lib/payment-link-cart'
@@ -46,7 +46,29 @@ async function assertMpPaymentIsThisCart(container: any, sellerId: string, mpPay
  */
 async function validatePaymentLinkCart(container: any, inPerson: any, cart: any, cartId: string): Promise<void> {
   const [lc] = await inPerson.listPaymentLinkCarts({ cart_id: cartId }, { take: 1 })
-  if (!lc) return
+  if (!lc) {
+    // Not a link cart: it may not carry the seller's hidden «Cobro libre» product at all —
+    // that product is payable only through a link, at the link's price. start-checkout
+    // refuses it too, but Medusa's own public completion path does not pass through there
+    // (codex security lens, PR 221 round 6).
+    const productIds = Array.from(new Set(((cart?.items ?? []) as any[]).map((i) => i?.product_id).filter(Boolean)))
+    if (productIds.length) {
+      let hidden = false
+      try {
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'product', fields: ['id', 'metadata'], filters: { id: productIds },
+        })
+        hidden = ((data ?? []) as any[]).some((p) => p?.metadata?.is_payment_link_product === true)
+      } catch (e) {
+        // This runs on EVERY cart completion in the shop: a lookup failure must not stop
+        // all checkouts. The worst a miss allows is the hidden product sold at its base
+        // price to its own seller — so this fails OPEN, loudly.
+        console.error('[complete-cart-in-person] hidden-product check unavailable', cartId, (e as Error)?.message)
+      }
+      if (hidden) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This product is payable only through its payment link.')
+    }
+    return
+  }
   if (!counterCartMatchesClaim(
     { total: cart?.total, items: (cart?.items ?? []) as any[] },
     { kind: LINK_HASH_KIND, payload_hash: String(lc.payload_hash), total_cents: Number(lc.total_cents) },
