@@ -221,15 +221,11 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
  * Is `cartId` a cart our server built for this source? Read from the server's own
  * record, never the cart's client-writable metadata (D8).
  */
-async function serverBuiltCart(
-  req: MedusaRequest,
-  cartId: string,
-  source: 'in_person' | 'payment_link',
-): Promise<{ status: string } | null> {
-  if (source !== 'in_person') return null // payment links register their carts in S4
+async function serverBuiltCart(req: MedusaRequest, cartId: string): Promise<{ status: string; kind: string } | null> {
+  // payment links register their carts in S4
   const inPerson: any = req.scope.resolve(IN_PERSON_MODULE)
   const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
-  return claim ? { status: String(claim.status) } : null
+  return claim ? { status: String(claim.status), kind: String(claim.kind) } : null
 }
 
 /** Take the one right to open this counter cart's checkout. True only for the winner. */
@@ -411,10 +407,13 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // POST /store/carts/:id) accept client `metadata`, so a buyer could label any cart
   // `in_person`. The source counts only when the server's own record names THIS cart
   // — an `in_person_sale` claim for a counter cart (payment links: S4).
-  const cartMeta = ((cart as any).metadata ?? {}) as Record<string, unknown>
-  const claimedSource = cartMeta.source === 'in_person' || cartMeta.source === 'payment_link' ? cartMeta.source : null
-  const serverClaim = claimedSource ? await serverBuiltCart(req, cartId, claimedSource) : null
-  const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? claimedSource : null
+  //
+  // So the decision never STARTS from metadata either: clearing `source` must not
+  // switch the protections off (codex, PR 218 — a cleared label plus
+  // `offer_amount_cents: 1` underpaid a server-priced counter sale). Every cart is
+  // looked up in the claim table by id; a cart with a claim IS a counter cart.
+  const serverClaim = await serverBuiltCart(req, cartId)
+  const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? 'in_person' : null
   if (serverCartSource === 'in_person') {
     // A counter cart opens exactly ONE payable checkout, and only while its sale waits
     // for payment: a cancelled sale must not become payable again, and a second call
@@ -426,6 +425,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // started). Cancel takes the same row with the opposite condition, so a cancel and
     // a checkout racing for one sale cannot both win — a check-then-act here let a
     // cancel land between the check and the provider session (codex, PR 218).
+    // The provider must be the one the sale's kind completes on (the same table the
+    // completeCart hook enforces): a card sale opened as `manual` would take the one
+    // checkout slot with a session completion then refuses — an unpayable sale
+    // (codex security lens, PR 218).
+    const expectedProvider = serverClaim!.kind === 'card'
+      ? (body.provider === 'stripe' || body.provider === 'mercadopago')
+      : serverClaim!.kind === 'transfer'
+        ? body.provider === 'manual'
+        : false
+    if (!expectedProvider) {
+      return res.status(422).json({ code: 'COUNTER_PROVIDER_MISMATCH', message: 'Este método de pago no corresponde a esta venta.' })
+    }
     if (!(await openCounterCheckout(req, cartId))) {
       return serverClaim!.status !== 'awaiting_payment'
         ? res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
@@ -436,9 +447,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     }
   }
   const isCounterCart = serverCartSource === 'in_person'
-  const paymentLinkId = serverCartSource === 'payment_link' && typeof cartMeta.payment_link_id === 'string'
-    ? cartMeta.payment_link_id
-    : null
+  // Payment links (S4) will resolve their id from their own table, like the claim above.
+  const paymentLinkId = null as string | null
   if (serverCartSource) {
     body.offer_amount_cents = undefined
     body.offer_id = undefined

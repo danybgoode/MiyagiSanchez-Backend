@@ -256,7 +256,8 @@ async function expireProviderCheckout(
   if (session.provider_id === 'pp_stripe-connect_stripe-connect') {
     const ctx = readStripePaymentContext(session.data)
     const sessionId = ctx?.stripe_session_id ?? (session.data.stripe_session_id as string | undefined)
-    if (!sessionId) return
+    // No id ⇒ we cannot prove the QR is dead; refuse rather than call it cancelled (codex, PR 218).
+    if (!sessionId) throw new Error('stripe session id missing — cannot expire the checkout')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-09-30.clover' as any })
     // Direct charges (US) live on the seller's account; MX destination charges on ours.
     const opts = ctx?.stripe_strategy === 'direct_charge' ? { stripeAccount: ctx.stripe_account_id } : undefined
@@ -271,7 +272,7 @@ async function expireProviderCheckout(
   }
   if (session.provider_id === 'pp_mercadopago_mercadopago') {
     const prefId = session.data.mp_preference_id
-    if (typeof prefId !== 'string' || !prefId) return
+    if (typeof prefId !== 'string' || !prefId) throw new Error('MP preference id missing — cannot expire the checkout')
     const sellerService = scope.resolve(SELLER_MODULE)
     const [seller] = await sellerService.listSellers({ id: sellerId })
     const token = await resolveSellerMpToken(sellerService, seller)

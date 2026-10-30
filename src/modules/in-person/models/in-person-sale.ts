@@ -40,6 +40,8 @@ const InPersonSale = model
   .indexes([
     { on: ['seller_id', 'client_id'], unique: true },
     { on: ['seller_id'] },
+    // Every checkout and every cart completion looks a cart up here by id (S2).
+    { on: ['cart_id'], where: 'cart_id IS NOT NULL' },
   ])
 
 export default InPersonSale
