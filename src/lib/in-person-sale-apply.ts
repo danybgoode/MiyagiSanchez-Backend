@@ -14,18 +14,17 @@
  * first — confirmed in the installed core-flows 2.21.2), never a second order.
  */
 import { randomUUID } from 'node:crypto'
-import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
+import { ContainerRegistrationKeys, Modules, generateEntityId } from '@medusajs/framework/utils'
 import {
-  capturePaymentWorkflow,
   completeCartWorkflow,
   createCartWorkflow,
   createPaymentCollectionForCartWorkflow,
 } from '@medusajs/medusa/core-flows'
 import { IN_PERSON_MODULE } from '../modules/in-person'
 import { SELLER_MODULE } from '../modules/seller'
-import { isUniqueViolationError } from '../modules/mercadolibre/sync-utils'
 import { resolveSellerProductIds } from '../api/store/_utils/seller-catalog-query'
-import { isHiddenCatalogProduct } from '../api/store/_utils/support'
+import { isHiddenCatalogProduct, isSupportProductMetadata } from '../api/store/_utils/support'
+import { captureOrderPayment } from './order-payment-capture'
 import { resolveShippingOptionIds } from '../api/store/_utils/fulfillment'
 import { readSellerOperatingMarket } from './seller-market'
 import { sellerRowEnforcement } from './seller-status'
@@ -77,13 +76,18 @@ async function assertSellerOwnsVariants(
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
   const { data } = await query.graph({
     entity: 'variant',
-    fields: ['id', 'product_id', 'product.metadata', 'product.status'],
+    fields: ['id', 'product_id', 'product.metadata'],
     filters: { id: variantIds },
   })
   const byId = new Map<string, any>((data ?? []).map((v: any) => [v.id, v]))
   const refused = variantIds.filter((id) => {
     const v = byId.get(id)
-    return !v || !owned.has(v.product_id) || isHiddenCatalogProduct(v.product?.metadata)
+    // Status is deliberately NOT checked: a paused (draft) listing is a product the
+    // merchant still physically holds and may hand over at the counter; "paused"
+    // governs online buyability, not ownership. Support/hidden products are not
+    // goods at all, so both predicates refuse them.
+    return !v || !owned.has(v.product_id)
+      || isHiddenCatalogProduct(v.product?.metadata) || isSupportProductMetadata(v.product?.metadata)
   })
   if (refused.length) {
     return refuse(422, 'VARIANT_NOT_OWNED', 'Uno o más productos no son de tu tienda.', { variant_ids: refused })
@@ -149,8 +153,10 @@ async function prepareCartForCash(scope: Scope, cartId: string): Promise<number>
     { relations: ['payment_sessions'] },
   )
   if (!collection?.payment_sessions?.length) {
-    // Direct module call, exactly as start-checkout's live manual branch does: the
-    // workflow variant re-checks region providers, which this path does not need.
+    // Direct module call, exactly as start-checkout's live manual branch does.
+    // `completeCartWorkflow` still requires the provider to be enabled in the cart's
+    // REGION (validate-cart-payments) — the live MX region has it, because every
+    // live "Pago directo" order completes through the same check.
     await paymentService.createPaymentSession(collectionId, {
       provider_id: MANUAL_PROVIDER_ID,
       data: { payment_method: 'cash', payment_received: false },
@@ -163,32 +169,31 @@ async function prepareCartForCash(scope: Scope, cartId: string): Promise<number>
   return Math.round(Number(collection.amount ?? 0))
 }
 
-/** Capture the order's cash payment unless it is already captured (takeover-safe). */
-async function captureCash(scope: Scope, orderId: string): Promise<void> {
+/** D5: capture via the shared helper, then stamp the order as paid with its cash facts. */
+async function captureCash(scope: Scope, orderId: string, cash: { tendered_cents: number | null; change_cents: number }): Promise<void> {
+  const capture = await captureOrderPayment(scope, orderId)
+  if (!capture.ok) throw new Error(`order ${orderId} has no payment to capture`)
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
-  const { data } = await query.graph({
-    entity: 'order',
-    fields: ['id', 'metadata', 'payment_collections.payments.id', 'payment_collections.payments.captured_at'],
-    filters: { id: orderId },
+  const { data } = await query.graph({ entity: 'order', fields: ['id', 'metadata'], filters: { id: orderId } })
+  const meta = ((data?.[0] as any)?.metadata ?? {}) as Record<string, any>
+  if (meta.payment_received === true && meta.in_person?.change_cents != null) return
+  const orderService = scope.resolve(Modules.ORDER)
+  await orderService.updateOrders(orderId, {
+    metadata: {
+      ...meta,
+      payment_received: true,
+      payment_received_at: meta.payment_received_at ?? new Date().toISOString(),
+      payment_confirmed_by: 'seller_counter',
+      in_person: { ...(meta.in_person ?? {}), tendered_cents: cash.tendered_cents, change_cents: cash.change_cents },
+    },
   })
-  const order = data?.[0] as any
-  const payment = order?.payment_collections?.[0]?.payments?.[0]
-  if (!payment?.id) throw new Error(`order ${orderId} has no payment to capture`)
-  if (!payment.captured_at) {
-    await capturePaymentWorkflow(scope as any).run({ input: { payment_id: payment.id } })
-  }
-  const meta = (order?.metadata ?? {}) as Record<string, unknown>
-  if (meta.payment_received !== true) {
-    const orderService = scope.resolve(Modules.ORDER)
-    await orderService.updateOrders(orderId, {
-      metadata: {
-        ...meta,
-        payment_received: true,
-        payment_received_at: new Date().toISOString(),
-        payment_confirmed_by: 'seller_counter',
-      },
-    })
-  }
+}
+
+/** The order this cart already became, if any (Medusa's own `order_cart` link). */
+async function orderForCart(scope: Scope, cartId: string): Promise<string | null> {
+  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'order_cart', fields: ['order_id'], filters: { cart_id: cartId } })
+  return (data?.[0] as any)?.order_id ?? null
 }
 
 async function orderTotalCents(scope: Scope, orderId: string): Promise<number> {
@@ -198,18 +203,35 @@ async function orderTotalCents(scope: Scope, orderId: string): Promise<number> {
 }
 
 /**
- * The claim insert hit the unique index. Medusa's service layer re-throws Postgres'
- * 23505 as its own `MedusaError` of type `duplicate_error` ("… already exists"), so
- * the raw-code check alone never matched — the money-path CI run of PR #214 proved
- * it: a concurrent replay surfaced as an unhandled error instead of a replay.
+ * The claim itself: `insert … on conflict do nothing returning id`. Returns the new
+ * id, or null when this (seller, client_id) already exists.
+ *
+ * Raw SQL rather than the generated `create`, because the generated path re-throws
+ * the unique violation as a generic `MedusaError(invalid_data, "… already exists")`
+ * (utils `dbErrorMapper`) — indistinguishable from real bad data. Matching its
+ * message would be guessing; ON CONFLICT is the database saying so (verifier, #214).
  */
-function isDuplicateClaimError(e: unknown): boolean {
-  return isUniqueViolationError(e) || (e as { type?: string } | null)?.type === 'duplicate_error'
+async function insertClaim(
+  scope: Scope,
+  row: { seller_id: string; client_id: string; kind: string; payload_hash: string; offline: boolean; claimed_at: Date; claim_token: string },
+): Promise<string | null> {
+  const res = await knexOf(scope).raw(
+    `insert into in_person_sale
+       (id, seller_id, client_id, kind, status, payload_hash, offline, oversold, claimed_at, claim_token)
+     values (?, ?, ?, ?, 'claimed', ?, ?, false, ?, ?)
+     on conflict (seller_id, client_id) do nothing
+     returning id`,
+    [generateEntityId(undefined, 'ips'), row.seller_id, row.client_id, row.kind, row.payload_hash, row.offline, row.claimed_at, row.claim_token],
+  )
+  return res?.rows?.[0]?.id ?? null
 }
 
 function isStockError(e: unknown): boolean {
   const msg = String((e as Error)?.message ?? e)
-  return /inventory|stock|required quantity/i.test(msg)
+  // Only Medusa's two "not enough" messages (core-flows confirm-inventory and the
+  // inventory module). A bare /stock/ also matched "not associated with any stock
+  // location" — a configuration fault that must NOT close the claim as sold out.
+  return /does not have the required inventory|not enough stock available/i.test(msg)
 }
 
 // ── Conditional claim writes ─────────────────────────────────────────────────────
@@ -282,8 +304,8 @@ export async function recordInPersonSale(
   const gate = sellerRowEnforcement(seller)
   if (!gate.present) return refuse(404, 'SELLER_NOT_FOUND', 'No encontramos tu tienda.')
   if (!gate.admits) return refuse(409, 'seller_not_active', 'Tu tienda no está activa.')
-  // D1: an unreadable market is NOT treated as mx here — a counter sale writes stock
-  // and money, so "I could not tell" refuses rather than guessing.
+  // D1: MX sellers only. A seller with no stored market reads as the legacy default
+  // (mx) — the same rule start-checkout applies to every live seller today.
   if (readSellerOperatingMarket(seller).market !== 'mx') {
     return refuse(422, 'IN_PERSON_MX_ONLY', 'Vender en persona está disponible para tiendas de México.')
   }
@@ -302,22 +324,20 @@ export async function recordInPersonSale(
   let claimId: string
   let existingCartId: string | null = null
   let replayed = false
-  try {
-    const row = await inPerson.createInPersonSales({
-      seller_id: sellerId,
-      client_id: sale.client_id,
-      kind: sale.kind,
-      status: 'claimed',
-      payload_hash: payloadHash,
-      offline: sale.offline,
-      claimed_at: now,
-      claim_token: token,
-    })
-    claimId = row.id
-  } catch (e) {
-    if (!isDuplicateClaimError(e)) throw e
+  const insertedId = await insertClaim(scope, {
+    seller_id: sellerId,
+    client_id: sale.client_id,
+    kind: sale.kind,
+    payload_hash: payloadHash,
+    offline: sale.offline,
+    claimed_at: now,
+    claim_token: token,
+  })
+  if (insertedId) {
+    claimId = insertedId
+  } else {
     const [existing] = await inPerson.listInPersonSales({ seller_id: sellerId, client_id: sale.client_id })
-    if (!existing) throw e
+    if (!existing) throw new Error('in_person_sale conflict but no row — refusing to guess')
     const outcome = decideExistingClaim(existing, payloadHash, now)
     switch (outcome.action) {
       case 'replay': {
@@ -348,7 +368,6 @@ export async function recordInPersonSale(
         if (!won) return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
         claimId = existing.id
         existingCartId = won.cart_id
-        replayed = true
         break
       }
     }
@@ -391,8 +410,13 @@ export async function recordInPersonSale(
       cartId = builtCartId
     }
 
+    // D4: `replayed` means THIS call did not create the order — the cart had already
+    // become one (a crash between completion and the claim update). A takeover that
+    // creates the first order is not a replay.
+    const priorOrderId = await orderForCart(scope, cartId)
+    replayed = priorOrderId != null
     const amountCents = await prepareCartForCash(scope, cartId)
-    if (cashChange(amountCents, sale.tendered_cents).short_cents > 0) {
+    if (!priorOrderId && cashChange(amountCents, sale.tendered_cents).short_cents > 0) {
       // Refused before the order exists. The claim is released, not failed: the
       // payload hash excludes the cash amount on purpose, so a resend with the
       // corrected amount takes the claim over and completes the same cart.
@@ -401,9 +425,9 @@ export async function recordInPersonSale(
     }
     const { result: completed } = await completeCartWorkflow(scope as any).run({ input: { id: cartId } })
     const orderId = (completed as any).id as string
-    await captureCash(scope, orderId)
     const total = await orderTotalCents(scope, orderId)
     const { change_cents } = cashChange(total, sale.tendered_cents)
+    await captureCash(scope, orderId, { tendered_cents: sale.tendered_cents, change_cents })
     // Unconditional on purpose: two owners can only ever complete the SAME recorded
     // cart, which Medusa resolves to the same order, so both write identical facts.
     await inPerson.updateInPersonSales({

@@ -13,7 +13,7 @@
 
 import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
 import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
-import { capturePaymentWorkflow } from '@medusajs/medusa/core-flows'
+import { captureOrderPayment } from '../../../../../../../lib/order-payment-capture'
 import { resolveSeller } from '../../../../../_utils/clerk-auth'
 import {
   resolveSellerProductIds,
@@ -53,16 +53,6 @@ async function resolveOrderForSeller(req: MedusaRequest, orderId: string) {
   return { order, sellerId: sellerAuth.sellerId, code: 200 as const }
 }
 
-async function getOrderPaymentId(req: MedusaRequest, orderId: string): Promise<string | null> {
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
-  const { data } = await (query as any).graph({
-    entity: 'order',
-    fields: ['id', 'payment_collections.payments.id'],
-    filters: { id: orderId },
-  })
-  return (data?.[0] as any)?.payment_collections?.[0]?.payments?.[0]?.id ?? null
-}
-
 export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
   const { id: orderId } = req.params
   const { order, code } = await resolveOrderForSeller(req, orderId)
@@ -81,15 +71,11 @@ export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
     return res.status(409).json({ message: 'El pago ya fue confirmado para este pedido.' })
   }
 
-  const paymentId = await getOrderPaymentId(req, orderId)
-  if (!paymentId) {
-    return res.status(422).json({ message: 'No se encontró el registro de pago para este pedido.' })
-  }
-
   try {
-    await capturePaymentWorkflow(req.scope).run({
-      input: { payment_id: paymentId },
-    })
+    const capture = await captureOrderPayment(req.scope, orderId)
+    if (!capture.ok) {
+      return res.status(422).json({ message: 'No se encontró el registro de pago para este pedido.' })
+    }
   } catch (e) {
     const msg = (e as Error).message ?? 'Capture failed'
     logger.error('confirm-payment', 'capture failed', { orderId, message: msg })

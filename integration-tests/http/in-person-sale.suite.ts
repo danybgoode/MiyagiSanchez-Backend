@@ -1,5 +1,5 @@
 /**
- * in-person-sale.integration.spec.ts — the counter's money path against a REAL
+ * in-person-sale.suite.ts — the counter's money path against a REAL
  * Postgres (in-person-sales epic, S1.2 · D2–D5).
  *
  * The pure claim decision is unit-tested in `src/lib/__tests__/in-person-sale.unit.spec.ts`.
@@ -11,7 +11,6 @@
  * route's only extra step is resolving the seller from a Clerk JWT, which this runner
  * has no issuer for. The seller id passed here is what that resolution returns.
  */
-import { medusaIntegrationTestRunner } from '@medusajs/test-utils'
 import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
 import { createProductsWorkflow, createInventoryLevelsWorkflow } from '@medusajs/medusa/core-flows'
 import { SELLER_MODULE } from '../../src/modules/seller'
@@ -21,12 +20,17 @@ import { recordInPersonSale } from '../../src/lib/in-person-sale-apply'
 import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
 
-jest.setTimeout(180_000)
 
 const uuid = () => crypto.randomUUID()
 
-medusaIntegrationTestRunner({
-  testSuite: ({ getContainer }) => {
+/**
+ * A SUITE, not a spec file. It is mounted inside `money-path.integration.spec.ts`'s one
+ * `medusaIntegrationTestRunner`: two runner files in the same `--runInBand` jest process
+ * broke the money-path suite with "Loaders for module Stock_location failed: Method
+ * Map.prototype.set called on incompatible receiver" (verifier, PR #214). One runner,
+ * one app boot, both suites.
+ */
+export function inPersonSaleSuite(getContainer: () => any) {
     describe('in-person cash sale — one real order, exactly once', () => {
       let sellerId: string
       let otherSellerId: string
@@ -80,7 +84,9 @@ medusaIntegrationTestRunner({
       beforeEach(async () => {
         const container = getContainer()
         const [region] = await container.resolve(Modules.REGION).createRegions([
-          { name: 'México', currency_code: 'mxn', countries: ['mx'] },
+          // pp_manual_manual must be enabled in the REGION: completeCartWorkflow's
+          // validate-cart-payments refuses a session whose provider the region lacks.
+          { name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_manual_manual'] } as any,
         ])
         const [channel] = await container.resolve(Modules.SALES_CHANNEL).createSalesChannels([{ name: 'MX operating' }])
         channelId = channel.id
@@ -230,6 +236,9 @@ medusaIntegrationTestRunner({
         const fixed = await recordInPersonSale(container as any, sellerId, { ...s, tendered_cents: 30000 })
         if (!fixed.ok) throw new Error(`${fixed.code}: ${fixed.message}`)
         expect(fixed.body.change_cents).toBe(0)
+        // The resend CREATED the order, so it is not a replay (D4).
+        expect(fixed.body.replayed).toBe(false)
+        expect(fixed.status).toBe(201)
       })
 
       it('more than the stock on hand is refused online (OUT_OF_STOCK) and the claim is closed', async () => {
@@ -241,5 +250,4 @@ medusaIntegrationTestRunner({
         expect(!again.ok && again.code).toBe('SALE_CLOSED')
       })
     })
-  },
-})
+}
