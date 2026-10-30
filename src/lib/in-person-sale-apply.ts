@@ -194,13 +194,19 @@ async function captureCash(scope: Scope, orderId: string, cash: { tendered_cents
   })
 }
 
-/** Cash facts already stamped on an order by an earlier attempt, or null if none were. */
-async function orderCashFacts(scope: Scope, orderId: string): Promise<{ tendered_cents: number | null; change_cents: number } | null> {
+/** The cash facts of the sale an existing order recorded (stamped, or derived from its original tender). */
+async function orderCashFacts(scope: Scope, orderId: string): Promise<{ tendered_cents: number | null; change_cents: number }> {
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
   const { data } = await query.graph({ entity: 'order', fields: ['id', 'metadata'], filters: { id: orderId } })
-  const ip = ((data?.[0] as any)?.metadata?.in_person ?? {}) as Record<string, unknown>
-  if (typeof ip.change_cents !== 'number') return null
-  return { tendered_cents: typeof ip.tendered_cents === 'number' ? ip.tendered_cents : null, change_cents: ip.change_cents }
+  const order = data?.[0] as any
+  const ip = (order?.metadata?.in_person ?? {}) as Record<string, unknown>
+  const tendered = typeof ip.tendered_cents === 'number' ? ip.tendered_cents : null
+  if (typeof ip.change_cents === 'number') return { tendered_cents: tendered, change_cents: ip.change_cents }
+  // No change stamped yet (the capture's metadata write failed): the ORIGINAL tendered
+  // amount still rides the order, copied from the cart at completion — derive from it,
+  // never from the retry's amount (codex re-review, #214).
+  const total = await orderTotalCents(scope, orderId)
+  return { tendered_cents: tendered, change_cents: cashChange(total, tendered).change_cents }
 }
 
 /** The order this cart already became, if any (Medusa's own `order_cart` link). */
@@ -350,7 +356,9 @@ export async function recordInPersonSale(
     claimId = insertedId
   } else {
     const [existing] = await inPerson.listInPersonSales({ seller_id: sellerId, client_id: sale.client_id })
-    if (!existing) throw new Error('in_person_sale conflict but no row — refusing to guess')
+    // The index still conflicts on a soft-deleted claim (deliberately — a removed
+    // claim must still block a replay); that is a closed sale, not a server error.
+    if (!existing) return refuse(409, 'SALE_CLOSED', 'Esta venta ya no se puede registrar.', { status: 'deleted' })
     const outcome = decideExistingClaim(existing, payloadHash, now)
     switch (outcome.action) {
       case 'replay': {
@@ -395,7 +403,11 @@ export async function recordInPersonSale(
           region_id: regionId,
           sales_channel_id: channelId,
           currency_code: 'mxn',
-          email: sale.buyer_email ?? PLACEHOLDER_BUYER_EMAIL,
+          // ALWAYS the placeholder, never the typed address: the cart workflow resolves
+          // its email to an existing customer, and buyer order pages list by customer —
+          // a seller typing a registered buyer's email would inject this order into that
+          // buyer's account (codex security lens, #214). The typed address is receipt-only.
+          email: PLACEHOLDER_BUYER_EMAIL,
           items: sale.lines.map((l) => ({ variant_id: l.variant_id, quantity: l.quantity })),
           metadata: {
             source: 'in_person',
@@ -408,7 +420,7 @@ export async function recordInPersonSale(
               tendered_cents: sale.tendered_cents,
               sold_at: sale.sold_at ?? now.toISOString(),
               offline: sale.offline,
-              buyer_email_placeholder: !sale.buyer_email,
+              receipt_email: sale.buyer_email,
             },
           },
         },

@@ -213,6 +213,22 @@ export function inPersonSaleSuite(getContainer: () => any) {
         expect(await getProductAvailableQuantity(container as any, productId)).toBe(3)
       })
 
+      it("a typed receipt email never attaches the order to that buyer's account (security lens #214)", async () => {
+        const container = getContainer()
+        const [registered] = await (container.resolve(Modules.CUSTOMER) as any).createCustomers([
+          { email: 'compradora@ejemplo.mx', has_account: true, metadata: { clerk_user_id: 'user_compradora' } },
+        ])
+        const r = await recordInPersonSale(container as any, sellerId, sale({ buyer_email: 'compradora@ejemplo.mx' }))
+        if (!r.ok) throw new Error(`${r.code}: ${r.message}`)
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'order', fields: ['id', 'email', 'customer_id', 'metadata'], filters: { id: r.body.order_id },
+        })
+        const order = data[0] as any
+        expect(order.customer_id).not.toBe(registered.id)
+        expect(order.email).toBe('mostrador@sin-correo.miyagisanchez.com')
+        expect(order.metadata.in_person.receipt_email).toBe('compradora@ejemplo.mx')
+      })
+
       it('the same client_id with a DIFFERENT sale is refused, not answered with the first order', async () => {
         const container = getContainer()
         const s = sale()
