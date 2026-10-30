@@ -41,8 +41,14 @@ type Scope = { resolve: (key: string) => any }
 /** D6: a walk-in buyer has no account and usually no email. Nothing is ever sent here. */
 export const PLACEHOLDER_BUYER_EMAIL = 'mostrador@sin-correo.miyagisanchez.com'
 
-/** The manual provider every live "Pago directo" checkout already uses (D5). */
-const MANUAL_PROVIDER_ID = 'pp_manual_manual'
+/**
+ * D5 (amended at build): the CASH provider, not the unified `pp_manual_manual`.
+ * `completeCartWorkflow` refuses a provider that is not enabled in the cart's region,
+ * and the live MX region enables `pp_cash_cash` but NOT `pp_manual_manual`
+ * (GET /store/payment-providers?region_id=<mx>, 2026-10-30; `setup-mexico` never
+ * added it). Same `ManualMxPaymentProvider` class, so capture behaves identically.
+ */
+const MANUAL_PROVIDER_ID = 'pp_cash_cash'
 
 export type RecordResult =
   | {
@@ -155,8 +161,7 @@ async function prepareCartForCash(scope: Scope, cartId: string): Promise<number>
   if (!collection?.payment_sessions?.length) {
     // Direct module call, exactly as start-checkout's live manual branch does.
     // `completeCartWorkflow` still requires the provider to be enabled in the cart's
-    // REGION (validate-cart-payments) — the live MX region has it, because every
-    // live "Pago directo" order completes through the same check.
+    // REGION (validate-cart-payments) — see MANUAL_PROVIDER_ID for why that is cash.
     await paymentService.createPaymentSession(collectionId, {
       provider_id: MANUAL_PROVIDER_ID,
       data: { payment_method: 'cash', payment_received: false },

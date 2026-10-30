@@ -12,7 +12,7 @@
  * has no issuer for. The seller id passed here is what that resolution returns.
  */
 import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
-import { createProductsWorkflow, createInventoryLevelsWorkflow } from '@medusajs/medusa/core-flows'
+import { createProductsWorkflow, createInventoryLevelsWorkflow, createRegionsWorkflow } from '@medusajs/medusa/core-flows'
 import { SELLER_MODULE } from '../../src/modules/seller'
 import { IN_PERSON_MODULE } from '../../src/modules/in-person'
 import { setupFulfillmentInfrastructure } from '../../src/api/store/_utils/fulfillment'
@@ -83,11 +83,12 @@ export function inPersonSaleSuite(getContainer: () => any) {
 
       beforeEach(async () => {
         const container = getContainer()
-        const [region] = await container.resolve(Modules.REGION).createRegions([
-          // pp_manual_manual must be enabled in the REGION: completeCartWorkflow's
-          // validate-cart-payments refuses a session whose provider the region lacks.
-          { name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_manual_manual'] } as any,
-        ])
+        // Through the WORKFLOW: `payment_providers` is a region↔provider LINK the workflow
+        // writes; the module's createRegions silently ignores it. The provider must be
+        // enabled in the region or completeCartWorkflow refuses the session (as live).
+        const { result: [region] } = await createRegionsWorkflow(container).run({
+          input: { regions: [{ name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_cash_cash'] }] },
+        })
         const [channel] = await container.resolve(Modules.SALES_CHANNEL).createSalesChannels([{ name: 'MX operating' }])
         channelId = channel.id
         const [location] = await container.resolve(Modules.STOCK_LOCATION).createStockLocations([{ name: 'MX' }])
