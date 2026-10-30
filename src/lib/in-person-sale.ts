@@ -155,6 +155,8 @@ export interface ExistingClaim {
 
 export type ClaimOutcome =
   | { action: 'replay'; order_id: string }
+  /** A card/transfer sale whose cart is built and waits for its payment (S2, D9/D10). */
+  | { action: 'awaiting'; cart_id: string }
   | { action: 'reject_reused'; }
   | { action: 'in_progress' }
   | { action: 'takeover'; cart_id: string | null }
@@ -170,10 +172,91 @@ export type ClaimOutcome =
 export function decideExistingClaim(existing: ExistingClaim, payloadHash: string, now: Date): ClaimOutcome {
   if (existing.payload_hash !== payloadHash) return { action: 'reject_reused' }
   if (existing.status === 'completed' && existing.order_id) return { action: 'replay', order_id: existing.order_id }
+  // Waiting is a settled state, not an in-flight one: the cart exists and the buyer is
+  // paying. A resend (a reload, a lost answer) gets the same cart back — never a second
+  // cart, which would mean a second checkout the buyer could also pay.
+  if (existing.status === 'awaiting_payment' && existing.cart_id) return { action: 'awaiting', cart_id: existing.cart_id }
   if (existing.status === 'cancelled' || existing.status === 'failed') {
     return { action: 'reject_closed', status: existing.status }
   }
   const claimedAt = new Date(existing.claimed_at).getTime()
   if (Number.isFinite(claimedAt) && now.getTime() - claimedAt < CLAIM_STALE_MS) return { action: 'in_progress' }
   return { action: 'takeover', cart_id: existing.cart_id }
+}
+
+/**
+ * Which payment providers may complete a counter cart of each kind (in-person-sales
+ * D5/D9/D10). Enforced in `completeCartWorkflow`'s validate hook, BEFORE the order
+ * exists: a buyer holding a card sale's cart id can switch its session to the cash
+ * provider through the public payment-session route and complete it — an order with
+ * no money behind it, stock reserved and revenue booked (codex security lens, PR 218).
+ */
+export const COUNTER_ALLOWED_PROVIDERS: Readonly<Record<InPersonSaleKind, ReadonlySet<string>>> = {
+  cash: new Set(['pp_cash_cash']),
+  card: new Set(['pp_stripe-connect_stripe-connect', 'pp_mercadopago_mercadopago']),
+  transfer: new Set(['pp_manual_manual']),
+}
+
+/** The providers among `providerIds` a counter cart of `kind` may NOT complete on. */
+export function disallowedCounterProviders(kind: string, providerIds: string[]): string[] {
+  const allowed = COUNTER_ALLOWED_PROVIDERS[kind as InPersonSaleKind]
+  if (!allowed) return [...providerIds]
+  return providerIds.filter((id) => !allowed.has(id))
+}
+
+/**
+ * Does a cart still hold exactly the sale its claim recorded? Lines are compared by the
+ * same canonical hash as the claim (merged by variant, sorted); the total — when the
+ * claim recorded one — must match to the centavo, which also catches a promotion code
+ * added through the public cart routes (codex security lens, PR 218).
+ */
+export function counterCartMatchesClaim(
+  cart: { total?: unknown; items: Array<{ variant_id?: string | null; quantity?: unknown }> },
+  claim: { kind: string; payload_hash: string; total_cents?: unknown },
+): boolean {
+  const merged = new Map<string, number>()
+  for (const it of cart.items ?? []) {
+    const v = typeof it?.variant_id === 'string' ? it.variant_id : ''
+    const q = Number(it?.quantity)
+    if (!v || !Number.isInteger(q) || q < 1) return false
+    merged.set(v, (merged.get(v) ?? 0) + q)
+  }
+  if (merged.size === 0) return false
+  const lines = [...merged.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([variant_id, quantity]) => ({ variant_id, quantity }))
+  if (inPersonPayloadHash({ kind: claim.kind as InPersonSaleKind, lines }) !== claim.payload_hash) return false
+  if (typeof claim.total_cents === 'number') {
+    return Math.round(Number(cart.total ?? NaN)) === claim.total_cents
+  }
+  return true
+}
+
+/**
+ * Which public store requests would MUTATE a cart or its payment — the routes a counter
+ * cart must refuse once the merchant rang it up (in-person-sales D8, codex rounds 5–9:
+ * every attack on a counter sale began with someone holding its cart id calling these).
+ *
+ * Returns the cart id the request targets, `{ collectionId }` for the payment-session
+ * route (the caller resolves its cart), `{ bodyCart: true }` for collection creation
+ * (cart id in the body), or null when the request is not a cart mutation. Our own
+ * routes that must keep working on counter carts are excluded by name: completion (the
+ * webhook and the transfer path), start-checkout and mp-authorize (both guard counter
+ * carts themselves). Reads are never mutations.
+ */
+export type CartMutationTarget = { cartId: string } | { collectionId: string } | { bodyCart: true } | null
+
+const OPEN_CART_ACTIONS = new Set(['complete', 'start-checkout', 'mp-authorize'])
+
+export function cartMutationTarget(method: string, path: string): CartMutationTarget {
+  const m = method.toUpperCase()
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return null
+  const clean = path.split('?')[0].replace(/\/+$/, '')
+  const pc = clean.match(/^\/store\/payment-collections\/([^/]+)\/payment-sessions$/)
+  if (pc) return { collectionId: pc[1] }
+  if (clean === '/store/payment-collections') return { bodyCart: true }
+  const c = clean.match(/^\/store\/carts\/([^/]+)(?:\/([^/]+))?/)
+  if (!c) return null
+  if (c[2] && OPEN_CART_ACTIONS.has(c[2])) return null
+  return { cartId: c[1] }
 }

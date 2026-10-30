@@ -25,6 +25,7 @@ import { SELLER_MODULE } from '../modules/seller'
 import { resolveSellerProductIds } from '../api/store/_utils/seller-catalog-query'
 import { isHiddenCatalogProduct, isSupportProductMetadata } from '../api/store/_utils/support'
 import { captureOrderPayment } from './order-payment-capture'
+import { getInPersonSaleStatus, type InPersonSaleState } from './in-person-sale-status'
 import { resolveShippingOptionIds } from '../api/store/_utils/fulfillment'
 import { readSellerOperatingMarket } from './seller-market'
 import { sellerRowEnforcement } from './seller-status'
@@ -55,10 +56,15 @@ export type RecordResult =
       ok: true
       status: 200 | 201
       body: {
-        order_id: string
+        /** Cash: the recorded order. Card/transfer: null until the payment completes the cart. */
+        order_id: string | null
         total_cents: number
         change_cents: number
         replayed: boolean
+        /** Card/transfer (S2): the cart the checkout runs on, and the claim's state. */
+        cart_id?: string
+        status?: InPersonSaleState
+        checkout_url?: string | null
       }
     }
   | { ok: false; status: number; code: string; message: string; details?: unknown }
@@ -303,6 +309,31 @@ async function releaseClaim(scope: Scope, claimId: string, token: string): Promi
 }
 
 /**
+ * The answer for a card/transfer sale whose cart is built (fresh, resumed or replayed).
+ * The STATE comes from the status read — the cart may already have become an order (a
+ * buyer who paid before this resend), and a replay must never report a paid sale as
+ * waiting (codex, PR 218).
+ */
+async function awaitingResult(scope: Scope, claim: any, status: 200 | 201, replayed: boolean): Promise<RecordResult> {
+  const st = await getInPersonSaleStatus(scope, claim.seller_id, claim.client_id)
+  return {
+    ok: true,
+    status,
+    body: {
+      order_id: st?.order_id ?? claim.order_id ?? null,
+      total_cents: st?.total_cents ?? 0,
+      change_cents: 0,
+      replayed,
+      cart_id: claim.cart_id,
+      status: st?.state ?? 'awaiting_payment',
+      // Read back from the payment session start-checkout opened — never stored from,
+      // or trusted to, a client (verifier, PR 218).
+      checkout_url: st?.checkout_url ?? null,
+    },
+  }
+}
+
+/**
  * Record one counter sale exactly once. `sale` must already be validated by
  * `validateInPersonSale`; `now` is injectable for the stale-claim boundary.
  */
@@ -312,12 +343,6 @@ export async function recordInPersonSale(
   sale: InPersonSaleInput,
   now: Date = new Date(),
 ): Promise<RecordResult> {
-  // S1 ships cash; card (S2.1) and transfer (S2.2) are refused BEFORE any claim, so
-  // a client that sends them early leaves nothing behind to clean up.
-  if (sale.kind !== 'cash') {
-    return refuse(422, 'KIND_NOT_AVAILABLE', 'Este método de cobro todavía no está disponible en el mostrador.')
-  }
-
   // ── validate: the seller may transact, in MX, with its own variants ──────────
   const sellerService = scope.resolve(SELLER_MODULE)
   const [seller] = await sellerService.listSellers({ id: sellerId })
@@ -376,6 +401,8 @@ export async function recordInPersonSale(
           },
         }
       }
+      case 'awaiting':
+        return awaitingResult(scope, existing, 200, true)
       case 'reject_reused':
         return refuse(409, 'CLIENT_ID_REUSED', 'Este identificador ya se usó para otra venta.')
       case 'reject_closed':
@@ -412,7 +439,8 @@ export async function recordInPersonSale(
           metadata: {
             source: 'in_person',
             seller_id: sellerId,
-            payment_method: 'cash',
+            // Card/transfer: start-checkout overwrites this with the provider it opens.
+            payment_method: sale.kind === 'cash' ? 'cash' : 'pending',
             fulfillment_method: 'in_person',
             in_person: {
               client_id: sale.client_id,
@@ -433,6 +461,28 @@ export async function recordInPersonSale(
         return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
       }
       cartId = builtCartId
+    }
+
+    if (sale.kind !== 'cash') {
+      // D9/D10: card and transfer stop here — the cart is the sale; the shop's own
+      // checkout (start-checkout) takes the payment and the webhook / «Ya me llegó»
+      // completes it. `awaiting_payment` is settled: a resend returns this same cart.
+      // Record the server-computed total WITH the state change: start-checkout and the
+      // completeCart hook refuse a cart whose lines or total no longer match it (a
+      // promotion or a line edit through the public cart routes — codex, PR 218).
+      const { data: priced } = await scope.resolve(ContainerRegistrationKeys.QUERY).graph({
+        entity: 'cart', fields: ['id', 'total'], filters: { id: cartId },
+      })
+      await knexOf(scope).raw(
+        `update in_person_sale
+            set status = 'awaiting_payment',
+                metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('total_cents', ?::int),
+                updated_at = now()
+          where id = ? and status = 'claimed'`,
+        [Math.round(Number((priced?.[0] as any)?.total ?? 0)), claimId],
+      )
+      const [row] = await inPerson.listInPersonSales({ id: claimId })
+      return awaitingResult(scope, row, existingCartId ? 200 : 201, Boolean(existingCartId))
     }
 
     // D4: `replayed` means THIS call did not create the order — the cart had already

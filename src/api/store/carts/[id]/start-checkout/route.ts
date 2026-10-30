@@ -18,6 +18,9 @@ import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
 import { Modules, ContainerRegistrationKeys } from '@medusajs/framework/utils'
 import { ICartModuleService, IPaymentModuleService, IPromotionModuleService } from '@medusajs/framework/types'
 import { SELLER_MODULE } from '../../../../../modules/seller'
+import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
+import { CHECKOUT_OPEN_STALE_MS, expireCounterCheckout } from '../../../../../lib/in-person-sale-status'
+import { counterCartMatchesClaim } from '../../../../../lib/in-person-sale'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
@@ -65,6 +68,11 @@ const SHIPPING_METHOD_LABEL: Record<string, string> = {
 }
 
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://miyagisanchez.com'
+
+// D8 (in-person-sales): a counter QR checkout expires after ~30 minutes. Stripe refuses
+// an `expires_at` under 30 minutes from when IT receives the request, so exactly 30
+// would fail on network latency — 31. Mercado Pago uses the same value so both match.
+const COUNTER_CHECKOUT_TTL_MS = 31 * 60 * 1000
 
 // Escrow: 3-day auto-confirm window (buyer must confirm delivery; else auto-captured)
 const ESCROW_AUTO_CAPTURE_DAYS = 3
@@ -212,6 +220,117 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
   return rows ?? []
 }
 
+/**
+ * Is `cartId` a cart our server built for this source? Read from the server's own
+ * record, never the cart's client-writable metadata (D8).
+ */
+type CounterClaim = { status: string; kind: string; payload_hash: string; seller_id: string; metadata: Record<string, unknown> | null }
+
+async function serverBuiltCart(req: MedusaRequest, cartId: string): Promise<CounterClaim | null> {
+  // payment links register their carts in S4
+  const inPerson: any = req.scope.resolve(IN_PERSON_MODULE)
+  const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
+  return claim
+    ? { status: String(claim.status), kind: String(claim.kind), payload_hash: String(claim.payload_hash), seller_id: String(claim.seller_id), metadata: claim.metadata ?? null }
+    : null
+}
+
+/** The cart still holds exactly the sale the claim recorded (lines and total). */
+async function counterCartIntact(req: MedusaRequest, cartId: string, claim: CounterClaim): Promise<boolean> {
+  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({
+    entity: 'cart',
+    fields: ['id', 'total', 'items.variant_id', 'items.quantity'],
+    filters: { id: cartId },
+  })
+  const cart = data?.[0] as any
+  return counterCartMatchesClaim(
+    { total: cart?.total, items: cart?.items ?? [] },
+    { kind: claim.kind, payload_hash: claim.payload_hash, total_cents: (claim.metadata as any)?.total_cents },
+  )
+}
+
+/** Take the one right to open this counter cart's checkout. True only for the winner. */
+async function openCounterCheckout(req: MedusaRequest, cartId: string): Promise<string | null> {
+  const knex: any = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  const mark = `metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_started_at', now()::text)`
+  const r = await knex.raw(
+    `update in_person_sale set ${mark}, updated_at = now()
+      where cart_id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null
+      returning metadata->>'checkout_started_at' as started`,
+    [cartId],
+  )
+  if ((r?.rows?.length ?? 0) > 0) return r.rows[0].started as string
+  // A start that died before creating its payment session (a provider error, a crash)
+  // must not wedge the sale forever (codex, PR 218): re-open it once it is stale and
+  // still has no collection — compare-and-set on the exact mark we read, the same
+  // condition cancel uses, so a re-open and a cancel cannot both win.
+  const [row] = (await knex.raw(
+    `select metadata->>'checkout_started_at' as started from in_person_sale where cart_id = ? and status = 'awaiting_payment'`,
+    [cartId],
+  ))?.rows ?? []
+  const started: string | undefined = row?.started
+  if (!started || Date.now() - new Date(started).getTime() < CHECKOUT_OPEN_STALE_MS) return null
+  if (await cartHasPaymentCollection(req, cartId)) return null
+  const re = await knex.raw(
+    `update in_person_sale set ${mark}, updated_at = now()
+      where cart_id = ? and status = 'awaiting_payment' and metadata->>'checkout_started_at' = ?
+      returning metadata->>'checkout_started_at' as started`,
+    [cartId, started],
+  )
+  return (re?.rows?.[0]?.started as string | undefined) ?? null
+}
+
+/**
+ * Fence: record which provider checkout this counter sale opened — ONLY if this request
+ * still holds the open mark and the sale still awaits payment. A cancel (or a second
+ * opener) that won meanwhile makes this fail, and the caller expires what it created.
+ * The recorded ref is what cancel expires: the server's own record, never the cart's
+ * current session, which the public payment-session route can replace.
+ */
+async function fenceCounterCheckout(req: MedusaRequest, cartId: string, mark: string, provider: string, ref: string): Promise<boolean> {
+  const knex: any = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  const r = await knex.raw(
+    `update in_person_sale
+        set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_provider', ?::text, 'checkout_ref', ?::text),
+            updated_at = now()
+      where cart_id = ? and status = 'awaiting_payment' and metadata->>'checkout_started_at' = ?
+      returning id`,
+    [provider, ref, cartId, mark],
+  )
+  return (r?.rows?.length ?? 0) > 0
+}
+
+/** Give the open mark back after a failure, so a retry can open at once (owner-conditional). */
+async function releaseCounterCheckout(req: MedusaRequest, cartId: string, mark: string): Promise<void> {
+  const knex: any = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  await knex.raw(
+    `update in_person_sale set metadata = metadata - 'checkout_started_at', updated_at = now()
+      where cart_id = ? and status = 'awaiting_payment' and metadata->>'checkout_started_at' = ?
+        and (metadata->>'checkout_ref') is null`,
+    [cartId, mark],
+  )
+}
+
+/** Unlink every payment collection from a counter cart (debris of a dead attempt). */
+async function unlinkCartCollection(req: MedusaRequest, cartId: string): Promise<void> {
+  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'cart', fields: ['id', 'payment_collection.id'], filters: { id: cartId } })
+  const pcId = (data?.[0] as any)?.payment_collection?.id
+  if (!pcId) return
+  await req.scope.resolve(ContainerRegistrationKeys.LINK).dismiss({
+    [Modules.CART]: { cart_id: cartId },
+    [Modules.PAYMENT]: { payment_collection_id: pcId },
+  })
+}
+
+/** Does this cart already carry a payment collection (i.e. a checkout was opened)? */
+async function cartHasPaymentCollection(req: MedusaRequest, cartId: string): Promise<boolean> {
+  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'cart', fields: ['id', 'payment_collection.id'], filters: { id: cartId } })
+  return Boolean((data?.[0] as any)?.payment_collection?.id)
+}
+
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const { id: cartId } = req.params
   const body = req.body as {
@@ -343,6 +462,98 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     return res.status(400).json({ message: 'Cart is empty' })
   }
 
+  // ── Server-built carts (in-person-sales D8) ───────────────────────────────
+  // A counter sale (`in_person`) or a payment link (`payment_link`) is a cart OUR
+  // server routes built and priced. The source is read from the CART's metadata —
+  // never the body — because only those routes write it. For such a cart the cart
+  // total IS the price: no client offer amount, coupon or bundle can move it.
+  //
+  // The metadata alone is NOT proof: Medusa's public store routes (POST /store/carts,
+  // POST /store/carts/:id) accept client `metadata`, so a buyer could label any cart
+  // `in_person`. The source counts only when the server's own record names THIS cart
+  // — an `in_person_sale` claim for a counter cart (payment links: S4).
+  //
+  // So the decision never STARTS from metadata either: clearing `source` must not
+  // switch the protections off (codex, PR 218 — a cleared label plus
+  // `offer_amount_cents: 1` underpaid a server-priced counter sale). Every cart is
+  // looked up in the claim table by id; a cart with a claim IS a counter cart.
+  const serverClaim = await serverBuiltCart(req, cartId)
+  const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? 'in_person' : null
+  if (serverCartSource === 'in_person') {
+    // A counter cart opens exactly ONE payable checkout, and only while its sale waits
+    // for payment: a cancelled sale must not become payable again, and a second call
+    // would link a second collection whose session cancel could never expire
+    // (verifier + codex, PR 218). The status route reads the one checkout URL back.
+    //
+    // Atomic: the right to open the checkout is a conditional write on the claim
+    // (`checkout_started_at` set only while the sale awaits payment and none was
+    // started). Cancel takes the same row with the opposite condition, so a cancel and
+    // a checkout racing for one sale cannot both win — a check-then-act here let a
+    // cancel land between the check and the provider session (codex, PR 218).
+    // The provider must be the one the sale's kind completes on (the same table the
+    // completeCart hook enforces): a card sale opened as `manual` would take the one
+    // checkout slot with a session completion then refuses — an unpayable sale
+    // (codex security lens, PR 218).
+    const expectedProvider = serverClaim!.kind === 'card'
+      ? (body.provider === 'stripe' || body.provider === 'mercadopago')
+      : serverClaim!.kind === 'transfer'
+        ? body.provider === 'manual'
+        : false
+    if (!expectedProvider) {
+      return res.status(422).json({ code: 'COUNTER_PROVIDER_MISMATCH', message: 'Este método de pago no corresponde a esta venta.' })
+    }
+    if (serverClaim!.status !== 'awaiting_payment') {
+      return res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
+    }
+    if (await cartHasPaymentCollection(req, cartId)) {
+      // A collection with a RECORDED checkout is the live one. One with no recorded
+      // checkout is debris from an attempt that died between linking it and fencing it
+      // (a crash); once that attempt is stale it is unlinked so the sale can be retried
+      // (codex, PR 218).
+      const meta = (serverClaim!.metadata ?? {}) as Record<string, unknown>
+      const started = typeof meta.checkout_started_at === 'string' ? meta.checkout_started_at : null
+      const stale = !started || Date.now() - new Date(started).getTime() >= CHECKOUT_OPEN_STALE_MS
+      if (meta.checkout_ref || !stale) {
+        return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+      }
+      await unlinkCartCollection(req, cartId)
+    }
+    // The cart must still be EXACTLY what the merchant rang up: anyone holding a cart id
+    // can edit its lines or add a promotion through Medusa's public cart routes, and the
+    // price below is the cart's (codex security lens, PR 218).
+    if (!(await counterCartIntact(req, cartId, serverClaim!))) {
+      return res.status(409).json({ code: 'CART_CHANGED', message: 'Esta venta cambió. Vuelve a cobrarla desde el mostrador.' })
+    }
+    if (supportCheckout) {
+      return res.status(422).json({ code: 'COUNTER_PROVIDER_MISMATCH', message: 'Este método de pago no corresponde a esta venta.' })
+    }
+    // The goods are handed over at the counter: no shipping, rental, escrow or address
+    // can ride a counter checkout, whatever the caller sends.
+    body.fulfillment_method = 'local_pickup'
+    body.shipping_quote = undefined
+    body.shipping_address = undefined
+    body.rental = undefined
+    body.escrow = false
+    body.pickup_spot_id = undefined
+    body.pickup_appointment = undefined
+    // The seller who receives the money is the sale's seller — never a caller-supplied id,
+    // which seller resolution would otherwise prefer (codex security lens, PR 218).
+    body.seller_id = serverClaim!.seller_id
+    //
+    // The ONE-checkout guarantee is taken later, AFTER the provider checkout exists
+    // (`openCounterCheckout` + `fenceCounterCheckout` below): marking here let any
+    // validation failure afterwards wedge the slot, and a stalled request could create a
+    // payable QR after a cancel (codex, PR 218).
+  }
+  const isCounterCart = serverCartSource === 'in_person'
+  // Payment links (S4) will resolve their id from their own table, like the claim above.
+  const paymentLinkId = null as string | null
+  if (serverCartSource) {
+    body.offer_amount_cents = undefined
+    body.offer_id = undefined
+    body.coupon_code = undefined
+  }
+
   const item = cart.items[0] as any
   const productId = item.product_id ?? item.variant?.product_id
 
@@ -387,7 +598,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       const isDigitalItem = listingType === 'digital' || listingType === 'print_ad'
       return isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem })
     })
-    if (cartHasCoordinatedItem && !isManual) {
+    // A counter sale hands the goods over in person, so "delivery is coordinated" has
+    // nothing left to coordinate — card by QR is exactly the point (D8).
+    if (cartHasCoordinatedItem && !isManual && !isCounterCart) {
       return res.status(422).json({ message: COORD_MESSAGE })
     }
   }
@@ -539,7 +752,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // offer override (offer_amount_cents already reflects an agreed price).
   const bundleSettings = (sellerSettings.bundles ?? null) as BundleSettings | null
   const itemCount = (cart.items ?? []).length
-  const bundleTier = body.offer_amount_cents || supportCheckout || rentalBooking ? null : resolveBundleTier(bundleSettings, itemCount)
+  const bundleTier = body.offer_amount_cents || supportCheckout || rentalBooking || serverCartSource ? null : resolveBundleTier(bundleSettings, itemCount)
   const bundleDiscountCents = bundleTier
     ? Math.round(itemsTotalCents * bundleTier.percent_off / 100)
     : 0
@@ -582,7 +795,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // ── Escrow mode is resolved early so it can be written to cart metadata before the payment branch
   const checkoutSettings = (sellerSettings.checkout ?? {}) as Record<string, unknown>
   const escrowModeSetting = (checkoutSettings.escrow_mode ?? 'off') as EscrowMode
-  const useEscrow = escrowModeSetting === 'required' || (escrowModeSetting === 'optional' && body.escrow === true)
+  // D8 (amended): never escrow a counter sale — the goods are handed over in person, so
+  // there is no delivery to confirm, and an authorize-only payment must not read as paid.
+  const useEscrow = !serverCartSource && (escrowModeSetting === 'required' || (escrowModeSetting === 'optional' && body.escrow === true))
 
   // payment_method recorded on the order: 'manual' for all direct payments,
   // otherwise the gateway id.
@@ -740,14 +955,21 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     console.error('[start-checkout] addShippingMethods failed:', e)
   }
 
-  const successUrl = `${SITE_URL}/payment/success?cart_id=${cartId}`
-  const cancelUrl = supportCheckout
+  // D8: a counter or link buyer lands on a neutral thank-you page; the webhook (and the
+  // reconcile cron) completes the cart, never this redirect.
+  const successUrl = serverCartSource
+    ? `${SITE_URL}/pago/listo?cart_id=${cartId}`
+    : `${SITE_URL}/payment/success?cart_id=${cartId}`
+  const cancelUrl = serverCartSource
+    ? `${SITE_URL}/pago/listo?cart_id=${cartId}&estado=cancelado`
+    : supportCheckout
     ? `${SITE_URL}/s/${seller.slug}?payment=cancelled`
     : `${SITE_URL}/l/${productId ?? cartId}?payment=cancelled`
   const paymentProductTitle = supportCheckout ? `Apoyo para ${seller.name}` : productTitle
   const paymentProductImage = supportCheckout ? null : productImage
 
   let providerData: Record<string, unknown> = {}
+  let counterMpToken: string | null = null
   let redirectUrl: string | null = null
   let providerId = 'pp_system_default'
 
@@ -837,6 +1059,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
     const session = await stripeClient.checkout.sessions.create({
       mode: 'payment',
+      // D8: just over Stripe's 30-minute minimum (see COUNTER_CHECKOUT_TTL_MS).
+      ...(isCounterCart ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) } : {}),
       line_items: lineItems,
       // MX: transfer_data + application_fee_amount (destination charge, platform context).
       // US: empty — a direct charge carries no transfer and no application fee; the
@@ -854,6 +1078,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         product_id: productId ?? '',
         seller_id: seller?.id ?? '',
         payment_method: 'stripe',
+        ...(serverCartSource ? { source: serverCartSource } : {}),
+        ...(paymentLinkId ? { payment_link_id: paymentLinkId } : {}),
         fulfillment_method: fulfillmentMethod,
         // Webhook routing context (D15). A direct-charge event must arrive with
         // `event.account` equal to this account; a destination-charge event must
@@ -922,6 +1148,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     }
 
     const sellerMpToken = await resolveSellerMpToken(sellerService, seller)
+    counterMpToken = sellerMpToken
     if (!sellerMpToken) {
       return res.status(422).json({
         message: 'La conexión de Mercado Pago del vendedor expiró. Pídele que la reconecte.',
@@ -965,11 +1192,19 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         pending: successUrl,
       },
       auto_return: 'approved',
+      // D8: a counter QR is paid within minutes or not at all; an expired preference
+      // cannot be paid after the merchant has walked away from the sale.
+      ...(isCounterCart ? {
+        expires: true,
+        expiration_date_to: new Date(Date.now() + COUNTER_CHECKOUT_TTL_MS).toISOString(),
+      } : {}),
       metadata: {
         cart_id: cartId,
         product_id: productId ?? '',
         seller_id: seller?.id ?? '',
         payment_method: 'mercadopago',
+        ...(serverCartSource ? { source: serverCartSource } : {}),
+        ...(paymentLinkId ? { payment_link_id: paymentLinkId } : {}),
         fulfillment_method: fulfillmentMethod,
         ...(supportMetadata ? {
           checkout_kind: 'support',
@@ -1034,6 +1269,30 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   }
 
   // ── Create Medusa PaymentCollection + PaymentSession ─────────────────────
+  // ── Counter: one checkout, fenced (D8/D9) ──────────────────────────────────
+  const counterRef = isCounterCart
+    ? (providerId === 'pp_stripe-connect_stripe-connect' ? (providerData.stripe_session_id as string | undefined)
+      : providerId === 'pp_mercadopago_mercadopago' ? (providerData.mp_preference_id as string | undefined)
+      : 'manual')
+    : undefined
+  const expireCreated = async () => {
+    if (counterRef && counterRef !== 'manual') {
+      await expireCounterCheckout(providerId, counterRef, providerData, counterMpToken).catch((err) =>
+        console.error('[start-checkout] could not expire a refused counter checkout', counterRef, err))
+    }
+  }
+  let counterMark: string | null = null
+  let counterLinkedCollectionId: string | null = null
+  if (isCounterCart) {
+    counterMark = await openCounterCheckout(req, cartId)
+    if (!counterMark) {
+      await expireCreated()
+      return serverClaim!.status !== 'awaiting_payment'
+        ? res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
+        : res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+    }
+  }
+
   try {
     const paymentCollection = await paymentService.createPaymentCollections({
       currency_code: currency,
@@ -1092,6 +1351,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       [Modules.CART]: { cart_id: cartId },
       [Modules.PAYMENT]: { payment_collection_id: paymentCollection.id },
     })
+    counterLinkedCollectionId = isCounterCart ? paymentCollection.id : null
 
     const responseBody: Record<string, unknown> = {
       redirect_url: redirectUrl,
@@ -1128,9 +1388,28 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         channel: supportMetadata.channel,
       }
     }
+    if (isCounterCart && counterMark && counterRef) {
+      if (!(await fenceCounterCheckout(req, cartId, counterMark, providerId, counterRef))) {
+        // A cancel won while we were creating this checkout: it must not stay payable.
+        await expireCreated()
+        return res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
+      }
+    }
     return res.json(responseBody)
   } catch (e) {
     console.error('[start-checkout] Medusa payment session error:', e)
+    if (isCounterCart && counterMark) {
+      await expireCreated()
+      // Unlink a collection this failed attempt attached, or the next attempt would be
+      // refused as CHECKOUT_EXISTS forever (codex, PR 218).
+      if (counterLinkedCollectionId) {
+        await req.scope.resolve(ContainerRegistrationKeys.LINK).dismiss({
+          [Modules.CART]: { cart_id: cartId },
+          [Modules.PAYMENT]: { payment_collection_id: counterLinkedCollectionId },
+        }).catch((err: unknown) => console.error('[start-checkout] could not unlink a failed counter collection', err))
+      }
+      await releaseCounterCheckout(req, cartId, counterMark).catch(() => {})
+    }
     // Fail loudly: without a Medusa PaymentSession the cart can never be
     // completed into an order, so reconciliation can't recover it either.
     // Never hand the buyer a redirect to a payment we can't track — let them

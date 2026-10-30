@@ -144,8 +144,89 @@ describe('decideExistingClaim', () => {
       .toEqual({ action: 'takeover', cart_id: 'cart_1' })
   })
 
+  it('a card/transfer sale waiting for payment hands back its SAME cart, even when old', () => {
+    const waiting = claim({ status: 'awaiting_payment', claimed_at: new Date(0) })
+    expect(decideExistingClaim(waiting, 'h1', now)).toEqual({ action: 'awaiting', cart_id: 'cart_1' })
+  })
+
+  it('a waiting sale under a reused client_id with a different sale is still refused', () => {
+    expect(decideExistingClaim(claim({ status: 'awaiting_payment' }), 'h2', now)).toEqual({ action: 'reject_reused' })
+  })
+
   it('cancelled and failed claims are closed, never re-applied', () => {
     expect(decideExistingClaim(claim({ status: 'failed' }), 'h1', now)).toEqual({ action: 'reject_closed', status: 'failed' })
     expect(decideExistingClaim(claim({ status: 'cancelled' }), 'h1', now)).toEqual({ action: 'reject_closed', status: 'cancelled' })
+  })
+})
+
+describe('disallowedCounterProviders (codex security lens, PR 218)', () => {
+  const { disallowedCounterProviders } = require('../in-person-sale')
+  it('a card sale may complete only on a card processor', () => {
+    expect(disallowedCounterProviders('card', ['pp_stripe-connect_stripe-connect'])).toEqual([])
+    expect(disallowedCounterProviders('card', ['pp_mercadopago_mercadopago'])).toEqual([])
+    expect(disallowedCounterProviders('card', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
+    expect(disallowedCounterProviders('card', ['pp_manual_manual'])).toEqual(['pp_manual_manual'])
+  })
+  it('cash only on cash, transfer only on the manual provider', () => {
+    expect(disallowedCounterProviders('cash', ['pp_cash_cash'])).toEqual([])
+    expect(disallowedCounterProviders('cash', ['pp_stripe-connect_stripe-connect'])).toEqual(['pp_stripe-connect_stripe-connect'])
+    expect(disallowedCounterProviders('transfer', ['pp_manual_manual'])).toEqual([])
+    expect(disallowedCounterProviders('transfer', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
+  })
+  it('an unknown kind allows nothing', () => {
+    expect(disallowedCounterProviders('barter', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
+  })
+})
+
+describe('counterCartMatchesClaim (codex security lens, PR 218)', () => {
+  const { counterCartMatchesClaim, inPersonPayloadHash } = require('../in-person-sale')
+  const lines = [{ variant_id: 'variant_a', quantity: 2 }, { variant_id: 'variant_b', quantity: 1 }]
+  const claim = { kind: 'card', payload_hash: inPersonPayloadHash({ kind: 'card', lines }), total_cents: 45000 }
+  const cart = (over: Record<string, unknown> = {}) => ({
+    total: 45000,
+    items: [{ variant_id: 'variant_b', quantity: 1 }, { variant_id: 'variant_a', quantity: 1 }, { variant_id: 'variant_a', quantity: 1 }],
+    ...over,
+  })
+
+  it('the cart the merchant rang up matches (lines merged and sorted)', () => {
+    expect(counterCartMatchesClaim(cart(), claim)).toBe(true)
+  })
+  it('a removed or reduced line does not match', () => {
+    expect(counterCartMatchesClaim(cart({ items: [{ variant_id: 'variant_a', quantity: 2 }] }), claim)).toBe(false)
+    expect(counterCartMatchesClaim(cart({ items: [{ variant_id: 'variant_a', quantity: 1 }, { variant_id: 'variant_b', quantity: 1 }] }), claim)).toBe(false)
+  })
+  it('a lower total (a promotion) does not match', () => {
+    expect(counterCartMatchesClaim(cart({ total: 1 }), claim)).toBe(false)
+  })
+  it('with no recorded total only the lines are compared (cash)', () => {
+    expect(counterCartMatchesClaim(cart({ total: 1 }), { ...claim, total_cents: undefined })).toBe(true)
+  })
+  it('an empty cart never matches', () => {
+    expect(counterCartMatchesClaim(cart({ items: [] }), claim)).toBe(false)
+  })
+})
+
+describe('cartMutationTarget (counter carts are server-owned)', () => {
+  const { cartMutationTarget } = require('../in-person-sale')
+  it.each([
+    ['POST', '/store/carts/cart_1', { cartId: 'cart_1' }],
+    ['POST', '/store/carts/cart_1/line-items', { cartId: 'cart_1' }],
+    ['DELETE', '/store/carts/cart_1/line-items/li_1', { cartId: 'cart_1' }],
+    ['POST', '/store/carts/cart_1/promotions', { cartId: 'cart_1' }],
+    ['POST', '/store/carts/cart_1/shipping-methods', { cartId: 'cart_1' }],
+    ['POST', '/store/payment-collections/pc_1/payment-sessions', { collectionId: 'pc_1' }],
+    ['POST', '/store/payment-collections', { bodyCart: true }],
+  ])('%s %s is a mutation', (m, p, expected) => {
+    expect(cartMutationTarget(m, p)).toEqual(expected)
+  })
+  it.each([
+    ['GET', '/store/carts/cart_1'],
+    ['POST', '/store/carts/cart_1/complete'],
+    ['POST', '/store/carts/cart_1/start-checkout'],
+    ['POST', '/store/carts/cart_1/mp-authorize'],
+    ['POST', '/store/carts'],
+    ['POST', '/store/sellers/me/in-person-orders'],
+  ])('%s %s is not', (m, p) => {
+    expect(cartMutationTarget(m, p)).toBeNull()
   })
 })

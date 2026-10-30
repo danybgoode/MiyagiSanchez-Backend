@@ -20,6 +20,7 @@ import {
 } from '../../../_utils/seller-catalog-query'
 import { readRentalBooking, deriveRentalBookingState } from '../../../../../lib/rental-booking'
 import { deriveOrderLifecycleStatus } from '../../../../../lib/order-status-transition'
+import { orderSourceOf } from '../../../../../lib/profit-ledger'
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const sellerAuth = await resolveSeller(req)
@@ -316,7 +317,10 @@ export function normalizeMedusaOrder(
   // stamped by `materializeMlOrder` at order-creation time. `metadata` is already
   // selected above, so no query change is needed — just surface it top-level
   // (normalizeMedusaOrder curates; it never passes raw metadata through).
-  const source = metadata.source === 'mercadolibre' ? 'mercadolibre' : 'miyagi'
+  // in-person-sales S2.3: counter and payment-link sales keep their own source so the
+  // inbox can badge and filter them; anything else stays the online default 'miyagi'.
+  const ledgerSource = orderSourceOf(metadata)
+  const source = ledgerSource === 'native' ? 'miyagi' : ledgerSource
 
   // Free-form seller tags (ml-orders-native S3 · US-7) — manual CRUD via
   // `[id]/tags`, plus the automatic 'mercadolibre' tag stamped at materialization.

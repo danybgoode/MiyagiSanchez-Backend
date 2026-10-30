@@ -39,7 +39,7 @@ jest.setTimeout(180_000)
 medusaIntegrationTestRunner({
   testSuite: ({ api, getContainer }) => {
     // in-person-sales S1.2 — mounted here, not as its own runner file (see the suite's header).
-    inPersonSaleSuite(getContainer)
+    inPersonSaleSuite(getContainer, api)
 
     describe('money path — a publishable key buys exactly what it should', () => {
       let regionId: string

@@ -24,6 +24,7 @@ import {
   buildNativeOrderEvents,
   buildMlOrderEvents,
   buildNativeShippingEvent,
+  orderSourceOf,
   type NativeOrderLine,
 } from './profit-ledger'
 
@@ -100,7 +101,7 @@ export async function appendOrderLedger(
     if (!order) return null
 
     const meta = (order.metadata ?? {}) as Record<string, unknown>
-    const source = meta.source === 'mercadolibre' ? 'mercadolibre' : 'native'
+    const source = orderSourceOf(meta)
     const currency = (order.currency_code || 'mxn').toLowerCase()
     const capturedAt = order.created_at ? new Date(order.created_at) : new Date()
     const items = (order.items ?? []).filter((i) => !!i?.id)
@@ -155,6 +156,7 @@ export async function appendOrderLedger(
     }))
 
     const events = buildNativeOrderEvents({
+      source,
       order_id: order.id,
       seller_id: sellerId,
       currency_code: currency,

@@ -19,6 +19,8 @@ import { setupFulfillmentInfrastructure } from '../../src/api/store/_utils/fulfi
 import { recordInPersonSale } from '../../src/lib/in-person-sale-apply'
 import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
+import { getInPersonSaleStatus, cancelInPersonSale } from '../../src/lib/in-person-sale-status'
+import { completeCartWorkflow, createPaymentCollectionForCartWorkflow } from '@medusajs/medusa/core-flows'
 
 
 const uuid = () => crypto.randomUUID()
@@ -30,7 +32,7 @@ const uuid = () => crypto.randomUUID()
  * Map.prototype.set called on incompatible receiver" (verifier, PR #214). One runner,
  * one app boot, both suites.
  */
-export function inPersonSaleSuite(getContainer: () => any) {
+export function inPersonSaleSuite(getContainer: () => any, api: any) {
     describe('in-person cash sale — one real order, exactly once', () => {
       let sellerId: string
       let otherSellerId: string
@@ -87,7 +89,7 @@ export function inPersonSaleSuite(getContainer: () => any) {
         // writes; the module's createRegions silently ignores it. The provider must be
         // enabled in the region or completeCartWorkflow refuses the session (as live).
         const { result: [region] } = await createRegionsWorkflow(container).run({
-          input: { regions: [{ name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_cash_cash'] }] },
+          input: { regions: [{ name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_cash_cash', 'pp_manual_manual'] }] },
         })
         const [channel] = await container.resolve(Modules.SALES_CHANNEL).createSalesChannels([{ name: 'MX operating' }])
         channelId = channel.id
@@ -266,6 +268,137 @@ export function inPersonSaleSuite(getContainer: () => any) {
         const s = sale({ lines: [{ variant_id: variantId, quantity: 6 }], tendered_cents: null })
         const r = await recordInPersonSale(container as any, sellerId, s)
         expect(!r.ok && r.code).toBe('OUT_OF_STOCK')
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        expect(!again.ok && again.code).toBe('SALE_CLOSED')
+      })
+
+      // ── S2 · card and transfer (D9/D10) ─────────────────────────────────────
+      // Completes the cart on the cash provider — exactly what the session-swap exploit
+      // does, which is why the card case below must be REFUSED.
+      async function payCart(container: any, cartId: string) {
+        await container.resolve(Modules.CART).addShippingMethods(cartId, [{
+          name: 'Entregado en persona', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cartId } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_cash_cash', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        await completeCartWorkflow(container).run({ input: { id: cartId } })
+      }
+
+      it('a card sale builds ONE cart and waits; a resend returns the same cart', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const first = await recordInPersonSale(container as any, sellerId, s)
+        if (!first.ok) throw new Error(`${first.code}: ${first.message}`)
+        expect(first.status).toBe(201)
+        expect(first.body.status).toBe('awaiting_payment')
+        expect(first.body.order_id).toBeNull()
+        expect(first.body.total_cents).toBe(30000)
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        if (!again.ok) throw new Error(again.code)
+        expect(again.body.cart_id).toBe(first.body.cart_id)
+        expect(again.body.replayed).toBe(true)
+
+        const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
+        expect(status?.state).toBe('awaiting_payment')
+        // Another seller cannot read it.
+        expect(await getInPersonSaleStatus(container as any, otherSellerId, s.client_id)).toBeNull()
+      })
+
+      it('a card cart CANNOT be completed on the cash provider — no order, no stock (codex security lens, PR 218)', async () => {
+        // The session-swap exploit: anyone holding the cart id can switch its session to
+        // pp_cash_cash (region-enabled) and complete it. The completeCart validate hook
+        // refuses before an order exists.
+        const container = getContainer()
+        const before = await getProductAvailableQuantity(container as any, productId)
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        let refused: string | null = null
+        try { await payCart(container, r.body.cart_id!) } catch (e) { refused = String((e as Error).message) }
+        // Refused by the recorded-checkout rule or the provider rule, whichever runs first.
+        expect(refused).toMatch(/no recorded checkout|cannot be completed with pp_cash_cash/)
+        const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
+        expect(status?.state).toBe('awaiting_payment')
+        expect(status?.order_id).toBeNull()
+        expect(await getProductAvailableQuantity(container as any, productId)).toBe(before)
+      })
+
+      it('a cancel never wins while a checkout is being opened, and a cancelled sale cannot start one (codex, PR 218)', async () => {
+        const container = getContainer()
+        const knex: any = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        // start-checkout's opening write (same SQL condition) has just won: no session yet.
+        await knex.raw(
+          `update in_person_sale set metadata = coalesce(metadata,'{}'::jsonb) || jsonb_build_object('checkout_started_at', now())
+            where cart_id = ? and status = 'awaiting_payment'`, [r.body.cart_id])
+        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(!cancel.ok && cancel.code).toBe('IN_PROGRESS')
+
+        // A fresh sale cancelled first: start-checkout's opening condition can no longer match.
+        const s2 = sale({ kind: 'card', tendered_cents: null })
+        const r2 = await recordInPersonSale(container as any, sellerId, s2)
+        if (!r2.ok) throw new Error(r2.code)
+        const c2 = await cancelInPersonSale(container as any, sellerId, s2.client_id)
+        expect(c2.ok && c2.status.state).toBe('cancelled')
+        const open = await knex.raw(
+          `update in_person_sale set metadata = coalesce(metadata,'{}'::jsonb) || jsonb_build_object('checkout_started_at', now())
+            where cart_id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null returning id`,
+          [r2.body.cart_id])
+        expect(open.rows).toHaveLength(0)
+      })
+
+      it('a CANCELLED transfer cannot be completed into an order afterwards (codex security lens, PR 218)', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'transfer', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        const c = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(c.ok && c.status.state).toBe('cancelled')
+        const cartId = r.body.cart_id!
+        await container.resolve(Modules.CART).addShippingMethods(cartId, [{
+          name: 'Entregado en persona', amount: 0,
+          shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cartId } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_manual_manual', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        let refused: string | null = null
+        try { await completeCartWorkflow(container).run({ input: { id: cartId } }) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/was closed/)
+      })
+
+      it('a counter cart cannot be edited or re-paid through Medusa\'s public routes (COUNTER_CART_LOCKED)', async () => {
+        const container = getContainer()
+        const [key] = await (container.resolve(Modules.API_KEY) as any).createApiKeys([{ title: 'pk', type: 'publishable', created_by: 't' }])
+        await container.resolve(ContainerRegistrationKeys.LINK).create({
+          [Modules.API_KEY]: { publishable_key_id: key.id },
+          [Modules.SALES_CHANNEL]: { sales_channel_id: channelId },
+        })
+        const headers = { 'x-publishable-api-key': key.token }
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        const status = async (fn: () => Promise<unknown>) => {
+          try { await fn(); return 200 } catch (e) { return (e as any)?.response?.status }
+        }
+        expect(await status(() => api.post(`/store/carts/${r.body.cart_id}/line-items`, { variant_id: variantId, quantity: 1 }, { headers }))).toBe(409)
+        expect(await status(() => api.post(`/store/carts/${r.body.cart_id}`, { metadata: { source: null } }, { headers }))).toBe(409)
+        expect(await status(() => api.post('/store/payment-collections', { cart_id: r.body.cart_id }, { headers }))).toBe(409)
+        // Reading it is fine.
+        expect(await status(() => api.get(`/store/carts/${r.body.cart_id}`, { headers }))).toBe(200)
+      })
+
+      it('an unpaid card sale cancels, and a cancelled sale cannot be resent', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'card', tendered_cents: null })
+        await recordInPersonSale(container as any, sellerId, s)
+        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(cancel.ok && cancel.status.state).toBe('cancelled')
         const again = await recordInPersonSale(container as any, sellerId, s)
         expect(!again.ok && again.code).toBe('SALE_CLOSED')
       })

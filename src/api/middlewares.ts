@@ -46,6 +46,7 @@ import {
 import { extractClerkUserId } from './store/_utils/clerk-auth'
 import { decidePortalGate } from './store/_utils/seller-portal-gate'
 import { SELLER_MODULE } from '../modules/seller'
+import { refuseCounterCartMutation } from './store/_utils/counter-cart-lock'
 import type SellerModuleService from '../modules/seller/service'
 
 /**
@@ -159,5 +160,8 @@ export default defineMiddlewares({
       matcher: '/store/sellers/me',
       middlewares: [gateSellerPortalWrites],
     },
+    // Counter carts are server-owned once rung up (in-person-sales D8).
+    { matcher: '/store/carts/*', middlewares: [refuseCounterCartMutation] },
+    { matcher: '/store/payment-collections*', middlewares: [refuseCounterCartMutation] },
   ],
 })
