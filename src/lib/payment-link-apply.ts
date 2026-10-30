@@ -12,6 +12,7 @@ import { SELLER_MODULE } from '../modules/seller'
 import { sellerRowEnforcement } from './seller-status'
 import { readSellerOperatingMarket } from './seller-market'
 import { assertSellerOwnsVariants } from './in-person-sale-apply'
+import { expireProviderCheckout } from './in-person-sale-status'
 import {
   derivePaymentLinkState,
   newPaymentLinkToken,
@@ -123,10 +124,37 @@ export async function cancelPaymentLink(scope: Scope, sellerId: string, linkId: 
     [linkId, sellerId],
   )
   const [after] = await svc.listPaymentLinks({ id: linkId, seller_id: sellerId }, { take: 1 })
+  // Expire every checkout this link already opened, so a buyer holding a QR or provider
+  // page cannot pay a cancelled link (codex security lens, PR 221 round 7). Best effort
+  // and logged: a payment already moving still lands as a recorded order (D13, never hidden).
+  if (r?.rows?.length) await expireLinkCheckouts(scope, sellerId, linkId)
   // The write is conditional; if it changed nothing, a payment closed the link between our
   // read and our write — report that, never "cancelled" (codex, PR 221 round 4).
   if (!(r?.rows?.length) && derivePaymentLinkState(after, now) === 'paid') {
     return { ok: false, status: 409, code: 'LINK_PAID', message: 'Este cobro ya se pagó.' }
   }
   return { ok: true, status: 200, body: toView(after, now) }
+}
+
+async function expireLinkCheckouts(scope: Scope, sellerId: string, linkId: string): Promise<void> {
+  const carts = await scope.resolve(IN_PERSON_MODULE).listPaymentLinkCarts({ payment_link_id: linkId }, { take: 500 })
+  const started = (carts ?? []).filter((c: any) => c?.metadata?.checkout_started_at)
+  if (!started.length) return
+  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
+  for (const c of started) {
+    try {
+      const { data: oc } = await query.graph({ entity: 'order_cart', fields: ['order_id'], filters: { cart_id: c.cart_id } })
+      if ((oc ?? []).length) continue // already an order: nothing payable left
+      const { data } = await query.graph({
+        entity: 'cart',
+        fields: ['id', 'payment_collection.payment_sessions.provider_id', 'payment_collection.payment_sessions.data'],
+        filters: { id: c.cart_id },
+      })
+      for (const sess of ((data?.[0] as any)?.payment_collection?.payment_sessions ?? []) as any[]) {
+        await expireProviderCheckout(scope, sellerId, { provider_id: String(sess.provider_id), data: sess.data ?? {}, cart_id: c.cart_id })
+      }
+    } catch (e) {
+      console.error('[payment-link] could not expire a checkout of a cancelled link', { linkId, cartId: c.cart_id, message: (e as Error)?.message })
+    }
+  }
 }
