@@ -326,7 +326,7 @@ export async function expireCounterCheckout(
  */
 export const CHECKOUT_OPEN_STALE_MS = 2 * 60 * 1000
 
-async function expireProviderCheckout(
+export async function expireProviderCheckout(
   scope: Scope,
   sellerId: string,
   session: { provider_id: string; data: Record<string, unknown>; cart_id?: string },

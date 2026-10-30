@@ -14,6 +14,7 @@
 import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
 import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
 import { captureOrderPayment } from '../../../../../../../lib/order-payment-capture'
+import { recordLinkOrder } from '../../../../../../../lib/payment-link-cart'
 import { resolveSeller } from '../../../../../_utils/clerk-auth'
 import {
   resolveSellerProductIds,
@@ -93,6 +94,12 @@ export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
       payment_confirmed_by: 'seller',
     },
   })
+
+  // A «Pago directo» order paid through a payment link closes its single-use link only
+  // now that the seller confirmed the money (in-person-sales S4, D13). Best effort: the
+  // confirmation itself already stands.
+  await recordLinkOrder(req.scope, orderId).catch((e: unknown) =>
+    logger.error('confirm-payment', 'could not record the payment on its link', { orderId, message: (e as Error)?.message }))
 
   return res.json({
     confirmed: true,

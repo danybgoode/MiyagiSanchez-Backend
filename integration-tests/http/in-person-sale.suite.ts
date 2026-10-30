@@ -20,6 +20,8 @@ import { recordInPersonSale } from '../../src/lib/in-person-sale-apply'
 import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
 import { getInPersonSaleStatus, cancelInPersonSale } from '../../src/lib/in-person-sale-status'
+import { createPaymentLink, cancelPaymentLink } from '../../src/lib/payment-link-apply'
+import { buildPaymentLinkCart, claimLinkCartCheckout, holdSingleUseLink, publicPaymentLink, recordLinkOrder } from '../../src/lib/payment-link-cart'
 import { completeCartWorkflow, createPaymentCollectionForCartWorkflow } from '@medusajs/medusa/core-flows'
 
 
@@ -101,6 +103,14 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         // D1 resolves the channel and region from the market env, exactly as in production.
         process.env.MEDUSA_MXN_REGION_ID = region.id
         process.env.MEDUSA_MX_OPERATING_CHANNEL_ID = channel.id
+        // Product creation (the payment-link «Cobro libre» product) also attaches the MX
+        // marketplace channel and fails closed without it — as production is configured.
+        const [marketplace] = await container.resolve(Modules.SALES_CHANNEL).createSalesChannels([{ name: 'MX marketplace' }])
+        process.env.MEDUSA_SALES_CHANNEL_ID = marketplace.id
+        await container.resolve(ContainerRegistrationKeys.LINK).create({
+          [Modules.SALES_CHANNEL]: { sales_channel_id: marketplace.id },
+          [Modules.STOCK_LOCATION]: { stock_location_id: location.id },
+        })
         process.env.MEDUSA_STOCK_LOCATION_ID = location.id
 
         await setupFulfillmentInfrastructure(container as any)
@@ -467,6 +477,174 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         expect(cancel.ok && cancel.status.state).toBe('cancelled')
         const again = await recordInPersonSale(container as any, sellerId, s)
         expect(!again.ok && again.code).toBe('SALE_CLOSED')
+      })
+
+      // ── S4 · payment links (D13–D15) ──────────────────────────────────────────
+      async function payOnManual(container: any, cartId: string, viaCheckout = true) {
+        // The real flow: start-checkout records the link cart's one checkout claim first.
+        if (viaCheckout) await claimLinkCartCheckout(container as any, cartId)
+        await container.resolve(Modules.CART).addShippingMethods(cartId, [{
+          name: 'Entrega', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cartId } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_manual_manual', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        const { result } = await completeCartWorkflow(container).run({ input: { id: cartId } })
+        return (result as any).id as string
+      }
+      async function linkRow(container: any, id: string) {
+        const [row] = await (container.resolve(IN_PERSON_MODULE) as any).listPaymentLinks({ id }, { take: 1 })
+        return row
+      }
+
+      it('a free-amount link: server-priced cart on the hidden product, paid once, then closed', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Anticipo pastel', amount_cents: 80000 })
+        if (!made.ok) throw new Error(`${made.code}: ${made.message}`)
+        const view = await publicPaymentLink(container as any, made.body.token)
+        if (!view.ok) throw new Error(view.code)
+        expect(view.body).toMatchObject({ state: 'pending', kind: 'amount', concept: 'Anticipo pastel', total_cents: 80000 })
+        expect(JSON.stringify(view.body)).not.toContain(sellerId)
+
+        const cart = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!cart.ok) throw new Error(`${cart.code}: ${cart.message}`)
+        expect(cart.body.total_cents).toBe(80000)
+        // A second opener's cart may NOT complete on the manual provider: only the cart
+        // holding the single-use link may (codex, PR 221 round 2).
+        const rival = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!rival.ok) throw new Error(rival.code)
+        expect(await holdSingleUseLink(container as any, made.body.id, cart.body.cart_id, 60_000)).toBe(true)
+        let refused: string | null = null
+        try { await payOnManual(container, rival.body.cart_id) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/Another checkout holds this payment link/)
+        const orderId = await payOnManual(container, cart.body.cart_id)
+        expect(orderId).toBeTruthy()
+        // The order is the seller's (its line is on a product the seller owns).
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'order', fields: ['id', 'total', 'items.title', 'items.product_id'], filters: { id: orderId },
+        })
+        expect((data[0] as any).items[0].title).toBe('Anticipo pastel')
+        expect(Math.round(Number((data[0] as any).total))).toBe(80000)
+
+        // A «Pago directo» order is NOT money yet: the link records it but stays open
+        // (verifier, PR 221) — anyone with the token could otherwise close it for free.
+        await recordLinkOrder(container as any, orderId)
+        let row = await linkRow(container, made.body.id)
+        expect(row.status).toBe('pending')
+        // Not payment evidence: listed as pending, never as paid (codex, PR 221 round 4).
+        expect(row.paid_order_ids ?? []).toEqual([])
+        expect(row.metadata.pending_order_ids).toEqual([orderId])
+        // …and a second buyer cannot pay the same single-use link meanwhile.
+        expect(await buildPaymentLinkCart(container as any, made.body.token)).toMatchObject({ ok: false, code: 'LINK_AWAITING_CONFIRMATION' })
+        // The seller confirms («Ya me llegó») → now the single-use link is paid and closed.
+        await container.resolve(Modules.ORDER).updateOrders(orderId, { metadata: { payment_received: true } })
+        await recordLinkOrder(container as any, orderId)
+        row = await linkRow(container, made.body.id)
+        expect(row.status).toBe('paid')
+        expect(row.paid_order_ids).toEqual([orderId])
+        expect(row.metadata.pending_order_ids).toEqual([])
+        const again = await buildPaymentLinkCart(container as any, made.body.token)
+        expect(!again.ok && again.code).toBe('LINK_PAID')
+      })
+
+      it('a single-use link holds ONE payable checkout at a time (codex, PR 221)', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Anticipo boda', amount_cents: 50000 })
+        if (!made.ok) throw new Error(made.code)
+        const a = await buildPaymentLinkCart(container as any, made.body.token)
+        const b = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!a.ok || !b.ok) throw new Error('two openers both get a cart')
+        expect(await holdSingleUseLink(container as any, made.body.id, a.body.cart_id, 60_000)).toBe(true)
+        // The second buyer cannot open a payable checkout while the first holds it…
+        expect(await holdSingleUseLink(container as any, made.body.id, b.body.cart_id, 60_000)).toBe(false)
+        // …the holder can renew…
+        expect(await holdSingleUseLink(container as any, made.body.id, a.body.cart_id, 60_000)).toBe(true)
+        // …and an expired hold frees the link.
+        await container.resolve(ContainerRegistrationKeys.PG_CONNECTION).raw(
+          `update payment_link set metadata = metadata || jsonb_build_object('hold_until', (now() - interval '1 second')::text) where id = ?`, [made.body.id])
+        expect(await holdSingleUseLink(container as any, made.body.id, b.body.cart_id, 60_000)).toBe(true)
+      })
+
+      it('link carts are server-owned: locked against public edits, refused when closed or changed (verifier, PR 221)', async () => {
+        const container = getContainer()
+        // 1) The public cart routes refuse a link cart.
+        const [key] = await (container.resolve(Modules.API_KEY) as any).createApiKeys([{ title: 'pk', type: 'publishable', created_by: 't' }])
+        await container.resolve(ContainerRegistrationKeys.LINK).create({
+          [Modules.API_KEY]: { publishable_key_id: key.id },
+          [Modules.SALES_CHANNEL]: { sales_channel_id: channelId },
+        })
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'products', lines: [{ variant_id: variantId, quantity: 1 }] })
+        if (!made.ok) throw new Error(made.code)
+        const cart = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!cart.ok) throw new Error(cart.code)
+        let status: number | undefined
+        try {
+          await api.post(`/store/carts/${cart.body.cart_id}/line-items`, { variant_id: variantId, quantity: 3 }, { headers: { 'x-publishable-api-key': key.token } })
+          status = 200
+        } catch (e) { status = (e as any)?.response?.status }
+        expect(status).toBe(409)
+
+        // 2) A cart changed behind the routes (module write) cannot complete.
+        await (container.resolve(Modules.CART) as any).addLineItems(cart.body.cart_id, [{ variant_id: variantId, quantity: 1, title: 'x', unit_price: 1 }])
+        let refused: string | null = null
+        try { await payOnManual(container, cart.body.cart_id) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/changed after it was built/)
+
+        // 3) A CANCELLED link's cart cannot be completed on the manual provider.
+        const made2 = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Seña', amount_cents: 20000 })
+        if (!made2.ok) throw new Error(made2.code)
+        const cart2 = await buildPaymentLinkCart(container as any, made2.body.token)
+        if (!cart2.ok) throw new Error(cart2.code)
+        await cancelPaymentLink(container as any, sellerId, made2.body.id)
+        refused = null
+        try { await payOnManual(container, cart2.body.cart_id) } catch (e) { refused = String((e as Error).message) }
+        // Refused either way: the checkout claim needs an open link, and the hook refuses a
+        // closed link on the manual provider.
+        expect(refused).toMatch(/payment link is closed|not paid through its checkout/)
+      })
+
+      it('a link cart that did not go through start-checkout cannot be completed (codex, PR 221 round 8)', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'products', uses: 'multi', lines: [{ variant_id: variantId, quantity: 1 }] })
+        if (!made.ok) throw new Error(made.code)
+        const cart = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!cart.ok) throw new Error(cart.code)
+        let refused: string | null = null
+        try { await payOnManual(container, cart.body.cart_id, false) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/not paid through its checkout/)
+      })
+
+      it('a multi-use product link gives every opener a fresh cart', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'products', uses: 'multi', lines: [{ variant_id: variantId, quantity: 1 }] })
+        if (!made.ok) throw new Error(made.code)
+        const a = await buildPaymentLinkCart(container as any, made.body.token)
+        const b = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!a.ok || !b.ok) throw new Error('expected two carts')
+        expect(a.body.cart_id).not.toBe(b.body.cart_id)
+        expect(a.body.total_cents).toBe(15000)
+      })
+
+      it('expired and cancelled links cannot be paid; another seller cannot cancel a link', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Envío especial', amount_cents: 25000 })
+        if (!made.ok) throw new Error(made.code)
+        expect(await cancelPaymentLink(container as any, otherSellerId, made.body.id)).toMatchObject({ ok: false, status: 404 })
+        const c = await cancelPaymentLink(container as any, sellerId, made.body.id)
+        expect(c.ok && c.body.state).toBe('cancelled')
+        expect(await buildPaymentLinkCart(container as any, made.body.token)).toMatchObject({ ok: false, code: 'LINK_CANCELLED' })
+
+        const old = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Viejo', amount_cents: 25000 })
+        if (!old.ok) throw new Error(old.code)
+        await (container.resolve(IN_PERSON_MODULE) as any).updatePaymentLinks({ id: old.body.id, expires_at: new Date(Date.now() - 1000) })
+        expect(await buildPaymentLinkCart(container as any, old.body.token)).toMatchObject({ ok: false, code: 'LINK_EXPIRED' })
+      })
+
+      it("a product link refuses another seller's variant", async () => {
+        const container = getContainer()
+        const r = await createPaymentLink(container as any, sellerId, { kind: 'products', lines: [{ variant_id: otherVariantId }] })
+        expect(!r.ok && r.code).toBe('VARIANT_NOT_OWNED')
       })
     })
 }

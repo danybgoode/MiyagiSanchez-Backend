@@ -10,9 +10,11 @@
  * existing at all. A cart with no counter claim is untouched.
  */
 import { completeCartWorkflow } from '@medusajs/medusa/core-flows'
-import { MedusaError } from '@medusajs/framework/utils'
+import { ContainerRegistrationKeys, MedusaError } from '@medusajs/framework/utils'
 import { IN_PERSON_MODULE } from '../../modules/in-person'
 import { counterCartMatchesClaim, disallowedCounterProviders } from '../../lib/in-person-sale'
+import { LINK_HASH_KIND, cartHoldsLink } from '../../lib/payment-link-cart'
+import { derivePaymentLinkState } from '../../lib/payment-link'
 import { SELLER_MODULE } from '../../modules/seller'
 import { resolveSellerMpToken } from '../../api/store/_utils/mp'
 
@@ -35,12 +37,76 @@ async function assertMpPaymentIsThisCart(container: any, sellerId: string, mpPay
   }
 }
 
+/**
+ * A payment-link cart (S4, D15) completes only as built (lines + recorded total), only on
+ * a card provider or the manual provider, and — once its link is closed (paid single-use,
+ * expired, cancelled) — only with processor-confirmed money: the manual provider
+ * authorizes unconditionally, so it could otherwise mint an order on a closed link.
+ * Mercado Pago payments are proved to be for THIS cart, in full (as counter carts).
+ */
+async function validatePaymentLinkCart(container: any, inPerson: any, cart: any, cartId: string): Promise<void> {
+  const [lc] = await inPerson.listPaymentLinkCarts({ cart_id: cartId }, { take: 1 })
+  if (!lc) {
+    // Not a link cart: it may not carry the seller's hidden «Cobro libre» product at all —
+    // that product is payable only through a link, at the link's price. start-checkout
+    // refuses it too, but Medusa's own public completion path does not pass through there
+    // (codex security lens, PR 221 round 6).
+    const productIds = Array.from(new Set(((cart?.items ?? []) as any[]).map((i) => i?.product_id).filter(Boolean)))
+    if (productIds.length) {
+      // Fail CLOSED (codex, PR 221 rounds 7–9): if this one lookup fails, cart completion's
+      // own dozens of queries are failing too, so refusing adds no real availability risk —
+      // while allowing would let the hidden product sell at its base price.
+      const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+        entity: 'product', fields: ['id', 'metadata'], filters: { id: productIds },
+      })
+      const hidden = ((data ?? []) as any[]).some((p) => p?.metadata?.is_payment_link_product === true)
+      if (hidden) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This product is payable only through its payment link.')
+    }
+    return
+  }
+  if (!counterCartMatchesClaim(
+    { total: cart?.total, items: (cart?.items ?? []) as any[] },
+    { kind: LINK_HASH_KIND, payload_hash: String(lc.payload_hash), total_cents: Number(lc.total_cents) },
+  )) {
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment-link cart changed after it was built.')
+  }
+  // Every payment of a link cart must have come through start-checkout — the only path
+  // that records this claim (Medusa's public payment-session routes are locked for link
+  // carts). Without it, no provider may complete the cart (codex, PR 221 round 8).
+  if (!lc?.metadata?.checkout_started_at) {
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment-link cart was not paid through its checkout.')
+  }
+  const [link] = await inPerson.listPaymentLinks({ id: lc.payment_link_id }, { take: 1 })
+  const open = link && derivePaymentLinkState(link, new Date()) === 'pending'
+  const sessions = ((cart?.payment_collection?.payment_sessions ?? []) as Array<{ status?: string; provider_id?: string; data?: any }>)
+    .filter((s) => PROCESSABLE.has(String(s?.status)))
+  for (const s of sessions) {
+    const p = String(s.provider_id)
+    if (p === 'pp_manual_manual') {
+      if (!open) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment link is closed.')
+      // A single-use link: only the cart holding it may complete on the manual provider
+      // (which authorizes unconditionally) — otherwise two carts could both become
+      // orders of one single-use link (codex, PR 221 round 2).
+      if (link.uses === 'single' && !cartHoldsLink(link, cartId, new Date())) {
+        throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'Another checkout holds this payment link.')
+      }
+      continue
+    }
+    if (p === 'pp_stripe-connect_stripe-connect') continue // the provider proves Stripe paid THIS session (stripe-authorization.ts)
+    if (p === 'pp_mercadopago_mercadopago') {
+      await assertMpPaymentIsThisCart(container, String(lc.seller_id), String(s?.data?.mp_payment_id ?? ''), cartId, Number(cart?.total ?? NaN))
+      continue
+    }
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, `A payment link cannot be completed with ${p}.`)
+  }
+}
+
 completeCartWorkflow.hooks.validate(async ({ cart }, { container }) => {
   const cartId = (cart as any)?.id
   if (!cartId) return
   const inPerson: any = container.resolve(IN_PERSON_MODULE)
   const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
-  if (!claim) return
+  if (!claim) return validatePaymentLinkCart(container, inPerson, cart, cartId)
   // A closed sale cannot become an order — except a CARD sale, whose provider authorizes
   // only a payment the processor confirmed: money already taken must still become its
   // order (never hidden). Transfer/cash authorize unconditionally, so after a cancel
