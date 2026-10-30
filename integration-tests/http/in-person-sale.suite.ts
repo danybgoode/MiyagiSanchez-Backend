@@ -273,8 +273,8 @@ export function inPersonSaleSuite(getContainer: () => any) {
       })
 
       // ── S2 · card and transfer (D9/D10) ─────────────────────────────────────
-      // A test stand-in for the provider webhook: complete the cart on the cash
-      // provider exactly as a paid checkout would complete it.
+      // Completes the cart on the cash provider — exactly what the session-swap exploit
+      // does, which is why the card case below must NOT read it as paid.
       async function payCart(container: any, cartId: string) {
         await container.resolve(Modules.CART).addShippingMethods(cartId, [{
           name: 'Entregado en persona', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
@@ -306,17 +306,21 @@ export function inPersonSaleSuite(getContainer: () => any) {
         expect(await getInPersonSaleStatus(container as any, otherSellerId, s.client_id)).toBeNull()
       })
 
-      it('a card sale is PAID only once its cart becomes an order — and a late cancel cannot hide it', async () => {
+      it('a card cart completed on the CASH provider is never reported paid (verifier, PR 218)', async () => {
+        // The session-swap exploit: anyone holding the cart id can switch its session to
+        // pp_cash_cash (region-enabled) and complete it. An order exists; no money moved.
+        // Card "paid" is reserved for the processor-confirmed providers (unit-pinned).
         const container = getContainer()
         const s = sale({ kind: 'card', tendered_cents: null })
         const r = await recordInPersonSale(container as any, sellerId, s)
         if (!r.ok) throw new Error(r.code)
         await payCart(container, r.body.cart_id!)
-        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
-        expect(cancel.ok && cancel.status.state).toBe('paid')
         const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
-        expect(status?.state).toBe('paid')
+        expect(status?.state).toBe('unverified')
         expect(status?.order_id).toBeTruthy()
+        // And a cancel after that cannot turn the existing order into "cancelled".
+        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(cancel.ok && cancel.status.state).toBe('unverified')
       })
 
       it('an unpaid card sale cancels, and a cancelled sale cannot be resent', async () => {

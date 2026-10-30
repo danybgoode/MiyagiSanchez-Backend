@@ -220,11 +220,22 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
  * Is `cartId` a cart our server built for this source? Read from the server's own
  * record, never the cart's client-writable metadata (D8).
  */
-async function serverBuiltCart(req: MedusaRequest, cartId: string, source: 'in_person' | 'payment_link'): Promise<boolean> {
-  if (source !== 'in_person') return false // payment links register their carts in S4
+async function serverBuiltCart(
+  req: MedusaRequest,
+  cartId: string,
+  source: 'in_person' | 'payment_link',
+): Promise<{ status: string } | null> {
+  if (source !== 'in_person') return null // payment links register their carts in S4
   const inPerson: any = req.scope.resolve(IN_PERSON_MODULE)
   const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
-  return Boolean(claim)
+  return claim ? { status: String(claim.status) } : null
+}
+
+/** Does this cart already carry a payment collection (i.e. a checkout was opened)? */
+async function cartHasPaymentCollection(req: MedusaRequest, cartId: string): Promise<boolean> {
+  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'cart', fields: ['id', 'payment_collection.id'], filters: { id: cartId } })
+  return Boolean((data?.[0] as any)?.payment_collection?.id)
 }
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
@@ -370,8 +381,20 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // — an `in_person_sale` claim for a counter cart (payment links: S4).
   const cartMeta = ((cart as any).metadata ?? {}) as Record<string, unknown>
   const claimedSource = cartMeta.source === 'in_person' || cartMeta.source === 'payment_link' ? cartMeta.source : null
-  const serverCartSource: 'in_person' | 'payment_link' | null =
-    claimedSource && (await serverBuiltCart(req, cartId, claimedSource)) ? claimedSource : null
+  const serverClaim = claimedSource ? await serverBuiltCart(req, cartId, claimedSource) : null
+  const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? claimedSource : null
+  if (serverCartSource === 'in_person') {
+    // A counter cart opens exactly ONE payable checkout, and only while its sale waits
+    // for payment: a cancelled sale must not become payable again, and a second call
+    // would link a second collection whose session cancel could never expire
+    // (verifier + codex, PR 218). The status route reads the one checkout URL back.
+    if (serverClaim!.status !== 'awaiting_payment') {
+      return res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
+    }
+    if (await cartHasPaymentCollection(req, cartId)) {
+      return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+    }
+  }
   const isCounterCart = serverCartSource === 'in_person'
   const paymentLinkId = serverCartSource === 'payment_link' && typeof cartMeta.payment_link_id === 'string'
     ? cartMeta.payment_link_id
@@ -623,7 +646,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // ── Escrow mode is resolved early so it can be written to cart metadata before the payment branch
   const checkoutSettings = (sellerSettings.checkout ?? {}) as Record<string, unknown>
   const escrowModeSetting = (checkoutSettings.escrow_mode ?? 'off') as EscrowMode
-  const useEscrow = escrowModeSetting === 'required' || (escrowModeSetting === 'optional' && body.escrow === true)
+  // D8 (amended): never escrow a counter sale — the goods are handed over in person, so
+  // there is no delivery to confirm, and an authorize-only payment must not read as paid.
+  const useEscrow = !serverCartSource && (escrowModeSetting === 'required' || (escrowModeSetting === 'optional' && body.escrow === true))
 
   // payment_method recorded on the order: 'manual' for all direct payments,
   // otherwise the gateway id.

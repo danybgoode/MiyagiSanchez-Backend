@@ -307,6 +307,18 @@ async function releaseClaim(scope: Scope, claimId: string, token: string): Promi
   )
 }
 
+async function checkoutUrlOfCart(scope: Scope, cartId: string): Promise<string | null> {
+  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({
+    entity: 'cart',
+    fields: ['id', 'payment_collection.payment_sessions.data'],
+    filters: { id: cartId },
+  })
+  const sessions = ((data?.[0] as any)?.payment_collection?.payment_sessions ?? []) as any[]
+  const url = sessions[sessions.length - 1]?.data?.redirect_url
+  return typeof url === 'string' ? url : null
+}
+
 /** The answer for a card/transfer sale whose cart is built (fresh, resumed or replayed). */
 async function awaitingResult(scope: Scope, claim: any, status: 200 | 201, replayed: boolean): Promise<RecordResult> {
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
@@ -321,7 +333,9 @@ async function awaitingResult(scope: Scope, claim: any, status: 200 | 201, repla
       replayed,
       cart_id: claim.cart_id,
       status: 'awaiting_payment',
-      checkout_url: (claim.metadata as any)?.checkout_url ?? null,
+      // Read back from the payment session start-checkout opened — never stored from,
+      // or trusted to, a client (verifier, PR 218).
+      checkout_url: await checkoutUrlOfCart(scope, claim.cart_id),
     },
   }
 }
@@ -336,8 +350,6 @@ export async function recordInPersonSale(
   sale: InPersonSaleInput,
   now: Date = new Date(),
 ): Promise<RecordResult> {
-  // S1 ships cash; card (S2.1) and transfer (S2.2) are refused BEFORE any claim, so
-  // a client that sends them early leaves nothing behind to clean up.
   // ── validate: the seller may transact, in MX, with its own variants ──────────
   const sellerService = scope.resolve(SELLER_MODULE)
   const [seller] = await sellerService.listSellers({ id: sellerId })

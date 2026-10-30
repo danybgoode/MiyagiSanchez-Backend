@@ -8,8 +8,8 @@ import { deriveSaleState } from '../in-person-sale-status'
 describe('deriveSaleState', () => {
   const card = (status: string) => ({ kind: 'card', status })
   const transfer = (status: string) => ({ kind: 'transfer', status })
-  const order = (over: Partial<{ payment_received: boolean; payment_status: string | null }> = {}) => ({
-    payment_received: false, payment_status: 'authorized', ...over,
+  const order = (over: Partial<{ payment_received: boolean; payment_status: string | null; provider_id: string | null }> = {}) => ({
+    payment_received: false, payment_status: 'authorized', provider_id: 'pp_stripe-connect_stripe-connect', ...over,
   })
 
   it('a card sale with no order is still waiting for the buyer', () => {
@@ -21,11 +21,19 @@ describe('deriveSaleState', () => {
   it('a card sale paid moments after a cancel is reported PAID, never hidden', () => {
     expect(deriveSaleState(card('cancelled'), order())).toBe('paid')
   })
+  it('a card cart completed on the CASH provider is never paid (verifier, PR 218 — the session-swap exploit)', () => {
+    expect(deriveSaleState(card('completed'), order({ provider_id: 'pp_cash_cash' }))).toBe('unverified')
+    expect(deriveSaleState(card('completed'), order({ provider_id: 'pp_manual_manual', payment_received: true }))).toBe('unverified')
+    expect(deriveSaleState(card('completed'), order({ provider_id: null }))).toBe('unverified')
+  })
+  it('a card sale paid through Mercado Pago is paid', () => {
+    expect(deriveSaleState(card('completed'), order({ provider_id: 'pp_mercadopago_mercadopago' }))).toBe('paid')
+  })
   it('a cancelled card sale with no order is cancelled', () => {
     expect(deriveSaleState(card('cancelled'), null)).toBe('cancelled')
   })
   it('a transfer order waits for «Ya me llegó» — nothing is auto-confirmed', () => {
-    expect(deriveSaleState(transfer('completed'), order())).toBe('pending_confirmation')
+    expect(deriveSaleState(transfer('completed'), order({ provider_id: 'pp_manual_manual' }))).toBe('pending_confirmation')
   })
   it('a transfer is paid once the merchant confirms (or the payment is captured)', () => {
     expect(deriveSaleState(transfer('completed'), order({ payment_received: true }))).toBe('paid')

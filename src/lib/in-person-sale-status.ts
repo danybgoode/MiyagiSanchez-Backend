@@ -22,6 +22,7 @@ export type InPersonSaleState =
   | 'awaiting_payment'      // card: QR shown, buyer has not paid · transfer: not yet completed
   | 'pending_confirmation'  // transfer: the order exists, the merchant has not said «Ya me llegó»
   | 'paid'                  // the money is confirmed (webhook-captured card, confirmed transfer, cash)
+  | 'unverified'            // card: an order exists but NOT through a card provider — never paid
   | 'cancelled'
   | 'failed'
 
@@ -39,11 +40,24 @@ export interface InPersonSaleStatus {
  * Pure: the state a claim + its order's facts mean. Exported for the unit spec.
  * `order` is null when the cart has not become an order.
  */
+/**
+ * The providers that confirm a card payment with the processor itself before the
+ * cart completes. A card sale is paid ONLY through one of these: a buyer can swap the
+ * session of a public cart to the cash provider (POST /store/payment-collections/:id/
+ * payment-sessions) and complete it — that order exists but no money moved
+ * (verifier, PR 218).
+ */
+export const CARD_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  'pp_stripe-connect_stripe-connect',
+  'pp_mercadopago_mercadopago',
+])
+
 export function deriveSaleState(
   claim: { kind: string; status: string },
-  order: { payment_received: boolean; payment_status: string | null } | null,
+  order: { payment_received: boolean; payment_status: string | null; provider_id: string | null } | null,
 ): InPersonSaleState {
   if (order) {
+    if (claim.kind === 'card' && !CARD_PROVIDER_IDS.has(order.provider_id ?? '')) return 'unverified'
     if (claim.kind === 'transfer') {
       return order.payment_received || order.payment_status === 'captured' ? 'paid' : 'pending_confirmation'
     }
@@ -100,17 +114,22 @@ export async function getInPersonSaleStatus(scope: Scope, sellerId: string, clie
     }
   }
 
-  let order: { payment_received: boolean; payment_status: string | null } | null = null
+  let order: { payment_received: boolean; payment_status: string | null; provider_id: string | null } | null = null
   let total = 0
   if (orderId) {
     const query = scope.resolve(ContainerRegistrationKeys.QUERY)
     const { data } = await query.graph({
       entity: 'order',
-      fields: ['id', 'total', 'payment_status', 'metadata'],
+      fields: ['id', 'total', 'payment_status', 'metadata', 'payment_collections.payments.provider_id'],
       filters: { id: orderId },
     })
     const o = data?.[0] as any
-    order = { payment_received: o?.metadata?.payment_received === true, payment_status: o?.payment_status ?? null }
+    const payment = (o?.payment_collections ?? []).flatMap((pc: any) => pc?.payments ?? [])[0]
+    order = {
+      payment_received: o?.metadata?.payment_received === true,
+      payment_status: o?.payment_status ?? null,
+      provider_id: payment?.provider_id ?? null,
+    }
     total = Math.round(Number(o?.total ?? 0))
   }
 
@@ -153,8 +172,11 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
     const { session } = await cartCheckout(scope, claim.cart_id)
     if (session) {
       try {
-        await expireProviderCheckout(scope, sellerId, session)
+        await expireProviderCheckout(scope, sellerId, { ...session, cart_id: claim.cart_id })
       } catch (e) {
+        if (e instanceof PaymentInFlight) {
+          return { ok: false, status: 409, code: 'PAYMENT_IN_PROGRESS', message: 'El comprador ya está pagando. Espera unos segundos.' }
+        }
         // Refuse to close a sale whose QR may still be payable: the merchant would
         // believe it cancelled while the buyer can still pay. Say so; they retry.
         console.error('[in-person] provider checkout expiry failed', { clientId, message: (e as Error)?.message })
@@ -173,10 +195,12 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
   return { ok: true, status: status! }
 }
 
+class PaymentInFlight extends Error {}
+
 async function expireProviderCheckout(
   scope: Scope,
   sellerId: string,
-  session: { provider_id: string; data: Record<string, unknown> },
+  session: { provider_id: string; data: Record<string, unknown>; cart_id?: string },
 ): Promise<void> {
   if (session.provider_id === 'pp_stripe-connect_stripe-connect') {
     const ctx = readStripePaymentContext(session.data)
@@ -186,6 +210,9 @@ async function expireProviderCheckout(
     // Direct charges (US) live on the seller's account; MX destination charges on ours.
     const opts = ctx?.stripe_strategy === 'direct_charge' ? { stripeAccount: ctx.stripe_account_id } : undefined
     const current = await stripe.checkout.sessions.retrieve(sessionId, opts)
+    // `complete` = the buyer paid and the webhook has not landed yet: cancelling now
+    // would tell the merchant "cancelled" moments before the sale turns paid.
+    if (current.status === 'complete') throw new PaymentInFlight()
     if (current.status === 'open') await stripe.checkout.sessions.expire(sessionId, opts)
     return
   }
@@ -196,6 +223,19 @@ async function expireProviderCheckout(
     const [seller] = await sellerService.listSellers({ id: sellerId })
     const token = await resolveSellerMpToken(sellerService, seller)
     if (!token) throw new Error('seller MP token unavailable')
+    if (!session.cart_id) throw new Error('cart id unavailable for the MP payment search')
+    // A payment already approved or in process for this cart means the money is (or may
+    // be) on its way — refuse to call that cancelled. external_reference is the cart id
+    // (start-checkout's preference payload).
+    const search = await fetch(
+      `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(session.cart_id ?? '')}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    if (!search.ok) throw new Error(`MP payment search ${search.status}`)
+    const found = ((await search.json())?.results ?? []) as Array<{ status?: string }>
+    if (found.some((p) => p.status === 'approved' || p.status === 'pending' || p.status === 'in_process' || p.status === 'authorized')) {
+      throw new PaymentInFlight()
+    }
     const res = await fetch(`https://api.mercadopago.com/checkout/preferences/${encodeURIComponent(prefId)}`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },

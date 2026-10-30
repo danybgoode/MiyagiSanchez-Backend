@@ -18,7 +18,7 @@ const InPersonSale = model
     client_id: model.text(),
     /** 'cash' | 'card' | 'transfer'. */
     kind: model.text(),
-    /** 'claimed' | 'completed' | 'cancelled' | 'failed'. */
+    /** 'claimed' | 'awaiting_payment' (card/transfer, S2) | 'completed' | 'cancelled' | 'failed'. */
     status: model.text(),
     /** sha256 of the canonical payload — the same client_id with a different sale is refused. */
     payload_hash: model.text(),
