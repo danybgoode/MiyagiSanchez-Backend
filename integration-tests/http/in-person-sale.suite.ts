@@ -21,7 +21,7 @@ import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
 import { getInPersonSaleStatus, cancelInPersonSale } from '../../src/lib/in-person-sale-status'
 import { createPaymentLink, cancelPaymentLink } from '../../src/lib/payment-link-apply'
-import { buildPaymentLinkCart, publicPaymentLink } from '../../src/lib/payment-link-cart'
+import { buildPaymentLinkCart, holdSingleUseLink, publicPaymentLink } from '../../src/lib/payment-link-cart'
 import { completeCartWorkflow, createPaymentCollectionForCartWorkflow } from '@medusajs/medusa/core-flows'
 
 
@@ -103,6 +103,14 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         // D1 resolves the channel and region from the market env, exactly as in production.
         process.env.MEDUSA_MXN_REGION_ID = region.id
         process.env.MEDUSA_MX_OPERATING_CHANNEL_ID = channel.id
+        // Product creation (the payment-link «Cobro libre» product) also attaches the MX
+        // marketplace channel and fails closed without it — as production is configured.
+        const [marketplace] = await container.resolve(Modules.SALES_CHANNEL).createSalesChannels([{ name: 'MX marketplace' }])
+        process.env.MEDUSA_SALES_CHANNEL_ID = marketplace.id
+        await container.resolve(ContainerRegistrationKeys.LINK).create({
+          [Modules.SALES_CHANNEL]: { sales_channel_id: marketplace.id },
+          [Modules.STOCK_LOCATION]: { stock_location_id: location.id },
+        })
         process.env.MEDUSA_STOCK_LOCATION_ID = location.id
 
         await setupFulfillmentInfrastructure(container as any)
@@ -516,6 +524,24 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         expect(row.paid_order_ids).toEqual([orderId])
         const again = await buildPaymentLinkCart(container as any, made.body.token)
         expect(!again.ok && again.code).toBe('LINK_PAID')
+      })
+
+      it('a single-use link holds ONE payable checkout at a time (codex, PR 221)', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Anticipo boda', amount_cents: 50000 })
+        if (!made.ok) throw new Error(made.code)
+        const a = await buildPaymentLinkCart(container as any, made.body.token)
+        const b = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!a.ok || !b.ok) throw new Error('two openers both get a cart')
+        expect(await holdSingleUseLink(container as any, made.body.id, a.body.cart_id, 60_000)).toBe(true)
+        // The second buyer cannot open a payable checkout while the first holds it…
+        expect(await holdSingleUseLink(container as any, made.body.id, b.body.cart_id, 60_000)).toBe(false)
+        // …the holder can renew…
+        expect(await holdSingleUseLink(container as any, made.body.id, a.body.cart_id, 60_000)).toBe(true)
+        // …and an expired hold frees the link.
+        await container.resolve(ContainerRegistrationKeys.PG_CONNECTION).raw(
+          `update payment_link set metadata = metadata || jsonb_build_object('hold_until', (now() - interval '1 second')::text) where id = ?`, [made.body.id])
+        expect(await holdSingleUseLink(container as any, made.body.id, b.body.cart_id, 60_000)).toBe(true)
       })
 
       it('a multi-use product link gives every opener a fresh cart', async () => {

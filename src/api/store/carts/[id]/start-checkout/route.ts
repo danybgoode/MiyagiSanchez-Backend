@@ -21,7 +21,8 @@ import { SELLER_MODULE } from '../../../../../modules/seller'
 import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
 import { CHECKOUT_OPEN_STALE_MS, expireCounterCheckout } from '../../../../../lib/in-person-sale-status'
 import { counterCartMatchesClaim } from '../../../../../lib/in-person-sale'
-import { LINK_HASH_KIND, linkCartFor } from '../../../../../lib/payment-link-cart'
+import { LINK_HASH_KIND, closedRefusal, holdSingleUseLink, linkCartFor } from '../../../../../lib/payment-link-cart'
+import { derivePaymentLinkState } from '../../../../../lib/payment-link'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
@@ -508,6 +509,21 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // with the shop — never carrier shipping, which would need a quote the link has not got.
     const inPersonSvc: any = req.scope.resolve(IN_PERSON_MODULE)
     const [lk] = await inPersonSvc.listPaymentLinks({ id: linkCart.payment_link_id }, { take: 1 })
+    // A cart built while the link was open cannot START paying once it is closed (codex,
+    // PR 221): a checkout opened BEFORE the close still completes if the processor took
+    // the money (the completion hook), but no new checkout opens on a closed link.
+    const linkState = lk ? derivePaymentLinkState(lk, new Date()) : 'cancelled'
+    if (linkState !== 'pending') {
+      const closed = closedRefusal(linkState)
+      return res.status(closed?.status ?? 410).json({ code: closed?.code ?? 'LINK_CLOSED', message: closed?.message ?? 'Este cobro ya no está disponible.' })
+    }
+    // A SINGLE-use link may have only ONE payable checkout at a time: two buyers paying
+    // at once would both be charged (codex, both lenses, PR 221). The hold is atomic and
+    // lasts the checkout's own lifetime (COUNTER_CHECKOUT_TTL_MS, which link checkouts
+    // also get below), so an abandoned attempt frees the link by itself.
+    if (lk.uses === 'single' && !(await holdSingleUseLink(req.scope, lk.id, cartId, COUNTER_CHECKOUT_TTL_MS))) {
+      return res.status(409).json({ code: 'LINK_BUSY', message: 'Alguien está pagando este cobro. Intenta de nuevo en unos minutos.' })
+    }
     body.fulfillment_method = lk?.kind === 'amount' ? 'digital' : 'local_pickup'
   }
   if (serverCartSource === 'in_person') {
@@ -1091,7 +1107,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     const session = await stripeClient.checkout.sessions.create({
       mode: 'payment',
       // D8: just over Stripe's 30-minute minimum (see COUNTER_CHECKOUT_TTL_MS).
-      ...(isCounterCart ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) } : {}),
+      ...(serverCartSource ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) } : {}),
       line_items: lineItems,
       // MX: transfer_data + application_fee_amount (destination charge, platform context).
       // US: empty — a direct charge carries no transfer and no application fee; the
@@ -1225,7 +1241,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       auto_return: 'approved',
       // D8: a counter QR is paid within minutes or not at all; an expired preference
       // cannot be paid after the merchant has walked away from the sale.
-      ...(isCounterCart ? {
+      ...(serverCartSource ? {
         expires: true,
         expiration_date_to: new Date(Date.now() + COUNTER_CHECKOUT_TTL_MS).toISOString(),
       } : {}),

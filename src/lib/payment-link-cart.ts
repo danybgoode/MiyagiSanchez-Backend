@@ -198,3 +198,27 @@ export async function linkCartFor(scope: Scope, cartId: string): Promise<any | n
 }
 
 export { closedRefusal }
+
+/**
+ * Take (or keep) a SINGLE-use link's one payable-checkout hold for `cartId` (codex, PR
+ * 221: two buyers paying one single-use link at once would both be charged). Atomic: the
+ * write succeeds only while the link is pending and the hold is free, expired, or already
+ * this cart's. The hold lasts `ttlMs` — the checkout's own lifetime — so an abandoned
+ * attempt frees the link by itself.
+ */
+export async function holdSingleUseLink(scope: Scope, linkId: string, cartId: string, ttlMs: number): Promise<boolean> {
+  const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  const r = await knex.raw(
+    `update payment_link
+        set metadata = coalesce(metadata, '{}'::jsonb)
+              || jsonb_build_object('hold_cart_id', ?::text, 'hold_until', (now() + (? || ' milliseconds')::interval)::text),
+            updated_at = now()
+      where id = ? and status = 'pending'
+        and (metadata->>'hold_until' is null
+             or (metadata->>'hold_until')::timestamptz < now()
+             or metadata->>'hold_cart_id' = ?)
+      returning id`,
+    [cartId, String(ttlMs), linkId, cartId],
+  )
+  return (r?.rows?.length ?? 0) > 0
+}
