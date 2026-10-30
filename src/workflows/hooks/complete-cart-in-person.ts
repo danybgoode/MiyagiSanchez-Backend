@@ -75,6 +75,12 @@ async function validatePaymentLinkCart(container: any, inPerson: any, cart: any,
   )) {
     throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment-link cart changed after it was built.')
   }
+  // Every payment of a link cart must have come through start-checkout — the only path
+  // that records this claim (Medusa's public payment-session routes are locked for link
+  // carts). Without it, no provider may complete the cart (codex, PR 221 round 8).
+  if (!lc?.metadata?.checkout_started_at) {
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment-link cart was not paid through its checkout.')
+  }
   const [link] = await inPerson.listPaymentLinks({ id: lc.payment_link_id }, { take: 1 })
   const open = link && derivePaymentLinkState(link, new Date()) === 'pending'
   const sessions = ((cart?.payment_collection?.payment_sessions ?? []) as Array<{ status?: string; provider_id?: string; data?: any }>)

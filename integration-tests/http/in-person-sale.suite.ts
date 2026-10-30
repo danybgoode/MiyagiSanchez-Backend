@@ -21,7 +21,7 @@ import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
 import { getInPersonSaleStatus, cancelInPersonSale } from '../../src/lib/in-person-sale-status'
 import { createPaymentLink, cancelPaymentLink } from '../../src/lib/payment-link-apply'
-import { buildPaymentLinkCart, holdSingleUseLink, publicPaymentLink, recordLinkOrder } from '../../src/lib/payment-link-cart'
+import { buildPaymentLinkCart, claimLinkCartCheckout, holdSingleUseLink, publicPaymentLink, recordLinkOrder } from '../../src/lib/payment-link-cart'
 import { completeCartWorkflow, createPaymentCollectionForCartWorkflow } from '@medusajs/medusa/core-flows'
 
 
@@ -480,7 +480,9 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
       })
 
       // ── S4 · payment links (D13–D15) ──────────────────────────────────────────
-      async function payOnManual(container: any, cartId: string) {
+      async function payOnManual(container: any, cartId: string, viaCheckout = true) {
+        // The real flow: start-checkout records the link cart's one checkout claim first.
+        if (viaCheckout) await claimLinkCartCheckout(container as any, cartId)
         await container.resolve(Modules.CART).addShippingMethods(cartId, [{
           name: 'Entrega', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
         }])
@@ -597,7 +599,20 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         await cancelPaymentLink(container as any, sellerId, made2.body.id)
         refused = null
         try { await payOnManual(container, cart2.body.cart_id) } catch (e) { refused = String((e as Error).message) }
-        expect(refused).toMatch(/payment link is closed/)
+        // Refused either way: the checkout claim needs an open link, and the hook refuses a
+        // closed link on the manual provider.
+        expect(refused).toMatch(/payment link is closed|not paid through its checkout/)
+      })
+
+      it('a link cart that did not go through start-checkout cannot be completed (codex, PR 221 round 8)', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'products', uses: 'multi', lines: [{ variant_id: variantId, quantity: 1 }] })
+        if (!made.ok) throw new Error(made.code)
+        const cart = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!cart.ok) throw new Error(cart.code)
+        let refused: string | null = null
+        try { await payOnManual(container, cart.body.cart_id, false) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/not paid through its checkout/)
       })
 
       it('a multi-use product link gives every opener a fresh cart', async () => {

@@ -1434,6 +1434,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       [Modules.PAYMENT]: { payment_collection_id: paymentCollection.id },
     })
     counterLinkedCollectionId = isCounterCart ? paymentCollection.id : null
+    if (linkCart) {
+      // Fence: the link must STILL be open now that its checkout exists. A cancel that
+      // landed between the claim and this point found no session to expire; whichever
+      // order they ran in, the checkout cannot outlive the cancel (codex security lens,
+      // PR 221 round 8).
+      const [now_] = await (req.scope.resolve(IN_PERSON_MODULE) as any).listPaymentLinks({ id: linkCart.payment_link_id }, { take: 1 })
+      if (!now_ || derivePaymentLinkState(now_, new Date()) !== 'pending') {
+        await expireCreated()
+        const closed = closedRefusal(now_ ? derivePaymentLinkState(now_, new Date()) : 'cancelled')
+        return res.status(closed?.status ?? 410).json({ code: closed?.code ?? 'LINK_CLOSED', message: closed?.message ?? 'Este cobro ya no está disponible.' })
+      }
+    }
 
     const responseBody: Record<string, unknown> = {
       redirect_url: redirectUrl,
