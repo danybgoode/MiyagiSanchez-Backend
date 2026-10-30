@@ -32,6 +32,7 @@ import { readSellerOperatingMarket } from './seller-market'
 import { sellerRowEnforcement } from './seller-status'
 import { resolveOperatingChannelId, resolveRegionIdForMarket } from './market-medusa'
 import {
+  CLAIM_STALE_MS,
   cashChange,
   decideExistingClaim,
   inPersonPayloadHash,
@@ -278,15 +279,21 @@ async function takeOverClaim(
   seenToken: string,
   newToken: string,
   now: Date,
-): Promise<{ cart_id: string | null } | null> {
+): Promise<{ cart_id: string | null; metadata: Record<string, unknown> | null } | null> {
+  // Staleness is re-checked IN the write, not only on the snapshot we read: the current
+  // owner renews `claimed_at` while it works (the D12 fence), and a takeover decided on an
+  // older read must lose to that renewal. The row returned is the row as taken over — its
+  // metadata, not the earlier snapshot's, decides whether to resume the D12 fallback
+  // (codex security lens, PR 220 round 4).
   const res = await knexOf(scope).raw(
     `update in_person_sale set claim_token = ?, claimed_at = ?, updated_at = now()
       where id = ? and claim_token = ? and status = 'claimed' and deleted_at is null
-      returning cart_id`,
-    [newToken, now, claimId, seenToken],
+        and claimed_at <= ?
+      returning cart_id, metadata`,
+    [newToken, now, claimId, seenToken, new Date(now.getTime() - CLAIM_STALE_MS)],
   )
   const row = res?.rows?.[0]
-  return row ? { cart_id: row.cart_id ?? null } : null
+  return row ? { cart_id: row.cart_id ?? null, metadata: row.metadata ?? null } : null
 }
 
 /** Record the cart this owner built. Fails if ownership moved, or a cart is already recorded. */
@@ -422,7 +429,7 @@ export async function recordInPersonSale(
         // OUTSIDE any cart. Resume THAT path (it adopts the order and finishes stock and
         // ledger) — the cart path cannot see it, and with stock back it would complete a
         // second order (verifier, PR 220).
-        resumeOversold = Boolean((existing.metadata as any)?.oversold_fallback_at)
+        resumeOversold = Boolean((won.metadata as any)?.oversold_fallback_at)
         break
       }
     }
