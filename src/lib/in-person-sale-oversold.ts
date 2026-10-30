@@ -65,77 +65,86 @@ export async function recordOversoldOfflineSale(
   // Fence: only the claim's CURRENT owner may create the order. A slow original request
   // whose claim was taken over (stale > 60 s) stops here instead of racing the new owner
   // into a second order (codex security lens, PR 220).
-  const fenced = await knex.raw(
-    `update in_person_sale set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('oversold_fallback_at', now()::text), updated_at = now()
-      where id = ? and claim_token = ? and status = 'claimed' returning id`,
-    [input.claimId, input.claimToken],
-  )
-  if (!(fenced?.rows?.length)) throw new OversoldOwnershipLost()
+  // One owner at a time per claim, for the WHOLE check-then-create: a fence checked once
+  // could be passed by a slow original request after a takeover, and both could find no
+  // order and create one (codex, PR 220 round 2). Inside the lock the token is re-checked
+  // and the existing-order lookup sees whatever the previous holder created. The lock's
+  // timeout is generous because Medusa uses it as the key's TTL too.
+  const locking = scope.resolve(Modules.LOCKING)
+  const orderId: string = await locking.execute(`in-person-oversold:${input.claimId}`, async () => {
+    const fenced = await knex.raw(
+      `update in_person_sale set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('oversold_fallback_at', now()::text), updated_at = now()
+        where id = ? and claim_token = ? and status = 'claimed' returning id`,
+      [input.claimId, input.claimToken],
+    )
+    if (!(fenced?.rows?.length)) throw new OversoldOwnershipLost()
 
-  let orderId = await existingOrderFor(scope, sellerId, sale.client_id)
-  if (!orderId) {
-    // Prices the way a cart would price them: the variant's calculated price in the MX region.
-    const { data: variants } = await query.graph({
-      entity: 'variant',
-      fields: ['id', 'title', 'product_id', 'product.title', 'calculated_price.calculated_amount'],
-      filters: { id: sale.lines.map((l) => l.variant_id) },
-      context: { calculated_price: QueryContext({ region_id: input.regionId, currency_code: 'mxn' }) },
-    })
-    const byId = new Map<string, any>((variants ?? []).map((v: any) => [v.id, v]))
-    const items = sale.lines.map((l) => {
-      const v = byId.get(l.variant_id)
-      const unit = Number(v?.calculated_price?.calculated_amount)
-      if (!v || !Number.isFinite(unit)) throw new Error(`no MX price for variant ${l.variant_id}`)
-      return {
-        title: v.product?.title ?? v.title ?? 'Producto',
-        variant_id: l.variant_id,
-        product_id: v.product_id,
-        quantity: l.quantity,
-        unit_price: unit,
-      }
-    })
-    const { result } = await recordOversoldWorkflow(scope as any).run({
-      input: {
-        orders: [{
-          region_id: input.regionId,
-          sales_channel_id: input.channelId,
-          email: input.email,
-          currency_code: 'mxn',
-          no_notification: true,
-          items,
-          metadata: {
-            source: 'in_person',
-            seller_id: sellerId,
-            payment_method: 'cash',
-            payment_received: true,
-            payment_received_at: input.soldAt,
-            payment_confirmed_by: 'seller_counter',
-            fulfillment_method: 'in_person',
-            in_person: {
-              client_id: sale.client_id,
-              kind: 'cash',
-              tendered_cents: sale.tendered_cents,
-              sold_at: input.soldAt,
-              offline: true,
-              receipt_email: sale.buyer_email,
+    let orderId = await existingOrderFor(scope, sellerId, sale.client_id)
+    if (!orderId) {
+      // Prices the way a cart would price them: the variant's calculated price in the MX region.
+      const { data: variants } = await query.graph({
+        entity: 'variant',
+        fields: ['id', 'title', 'product_id', 'product.title', 'calculated_price.calculated_amount'],
+        filters: { id: sale.lines.map((l) => l.variant_id) },
+        context: { calculated_price: QueryContext({ region_id: input.regionId, currency_code: 'mxn' }) },
+      })
+      const byId = new Map<string, any>((variants ?? []).map((v: any) => [v.id, v]))
+      const items = sale.lines.map((l) => {
+        const v = byId.get(l.variant_id)
+        const unit = Number(v?.calculated_price?.calculated_amount)
+        if (!v || !Number.isFinite(unit)) throw new Error(`no MX price for variant ${l.variant_id}`)
+        return {
+          title: v.product?.title ?? v.title ?? 'Producto',
+          variant_id: l.variant_id,
+          product_id: v.product_id,
+          quantity: l.quantity,
+          unit_price: unit,
+        }
+      })
+      const { result } = await recordOversoldWorkflow(scope as any).run({
+        input: {
+          orders: [{
+            region_id: input.regionId,
+            sales_channel_id: input.channelId,
+            email: input.email,
+            currency_code: 'mxn',
+            no_notification: true,
+            items,
+            metadata: {
+              source: 'in_person',
+              seller_id: sellerId,
+              payment_method: 'cash',
+              payment_received: true,
+              payment_received_at: input.soldAt,
+              payment_confirmed_by: 'seller_counter',
+              fulfillment_method: 'in_person',
+              in_person: {
+                client_id: sale.client_id,
+                kind: 'cash',
+                tendered_cents: sale.tendered_cents,
+                sold_at: input.soldAt,
+                offline: true,
+                receipt_email: sale.buyer_email,
+              },
+              // Filled in once stock is taken (below); `oversold_stock_done` marks that step
+              // so a retry that adopts this order finishes it instead of skipping it.
+              oversold: null,
+              oversold_stock_done: false,
             },
-            // Filled in once stock is taken (below); `oversold_stock_done` marks that step
-            // so a retry that adopts this order finishes it instead of skipping it.
-            oversold: null,
-            oversold_stock_done: false,
-          },
-        } as CreateOrderDTO],
-      },
-    })
-    orderId = ((Array.isArray(result) ? result[0] : result) as any).id as string
-  }
+          } as CreateOrderDTO],
+        },
+      })
+      orderId = ((Array.isArray(result) ? result[0] : result) as any).id as string
+    }
+    return orderId!
+  }, { timeout: 120 })
 
-  const oversold = await takeStockOnce(scope, orderId!, sale.lines)
+  const oversold = await takeStockOnce(scope, orderId, sale.lines)
   // Idempotent (dedupe keys): safe to call on every attempt, including an adoption.
-  await appendOrderLedger(scope as never, orderId!)
+  await appendOrderLedger(scope as never, orderId)
 
   const { data: totals } = await query.graph({ entity: 'order', fields: ['id', 'total'], filters: { id: orderId } })
-  return { orderId: orderId!, totalCents: Math.round(Number((totals?.[0] as any)?.total ?? 0)), oversold }
+  return { orderId, totalCents: Math.round(Number((totals?.[0] as any)?.total ?? 0)), oversold }
 }
 
 /**
@@ -183,14 +192,29 @@ async function takeStockOnce(
       const [level] = await inventory.listInventoryLevels({ inventory_item_id: itemId, location_id: locationId })
       available[l.variant_id] = Number(level?.stocked_quantity ?? 0) - Number(level?.reserved_quantity ?? 0)
     }
-    const plan = planOversoldDecrement(lines, available)
-    for (const p of plan) {
+    // The plan is fixed on the FIRST attempt and stored, with each line marked applied
+    // right after its own adjustment: a retry after a partial failure resumes from the
+    // stored plan and skips applied lines instead of decrementing them again (codex,
+    // PR 220 round 2). Residual window: a crash between one line's adjustInventory and its
+    // marker write — one line, at most once.
+    const plan: Array<ReturnType<typeof planOversoldDecrement>[number] & { applied?: boolean }> =
+      Array.isArray(meta.oversold_plan) ? meta.oversold_plan : planOversoldDecrement(lines, available)
+    let current = { ...meta, oversold_plan: plan }
+    if (!Array.isArray(meta.oversold_plan)) await orderService.updateOrders(orderId, { metadata: current })
+    for (let i = 0; i < plan.length; i++) {
+      const p = plan[i]
       const itemId = itemOf[p.variant_id]
-      if (itemId && locationId && p.decrement > 0) await inventory.adjustInventory(itemId, locationId, -p.decrement)
+      if (p.applied || !itemId || !locationId || p.decrement <= 0) continue
+      await inventory.adjustInventory(itemId, locationId, -p.decrement)
+      plan[i] = { ...p, applied: true }
+      current = { ...current, oversold_plan: plan }
+      await orderService.updateOrders(orderId, { metadata: current })
     }
-    const shortfall = plan.filter((p) => p.shortfall > 0)
+    const shortfall = plan
+      .filter((p) => p.shortfall > 0)
+      .map(({ variant_id, quantity, decrement, shortfall: short }) => ({ variant_id, quantity, decrement, shortfall: short }))
     await orderService.updateOrders(orderId, {
-      metadata: { ...meta, oversold: shortfall.length ? { lines: shortfall } : null, oversold_stock_done: true },
+      metadata: { ...current, oversold: shortfall.length ? { lines: shortfall } : null, oversold_stock_done: true },
     })
     return shortfall
   }
