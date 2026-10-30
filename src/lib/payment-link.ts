@@ -77,6 +77,11 @@ export function validatePaymentLinkInput(body: unknown, now: Date = new Date()):
     merged.set(variantId, (merged.get(variantId) ?? 0) + qty)
   }
   if (merged.size > MAX_LINES) return fail('TOO_MANY_LINES', `Máximo ${MAX_LINES} productos por link.`)
+  // The cap applies to the MERGED quantity too: repeated lines of one variant must not
+  // add up past it (codex, PR 221 round 3).
+  for (const q of merged.values()) {
+    if (q > MAX_QUANTITY) return fail('INVALID_QUANTITY', `La cantidad debe ser un entero entre 1 y ${MAX_QUANTITY}.`)
+  }
   const lines = [...merged.entries()]
     .sort(([a], [z]) => (a < z ? -1 : a > z ? 1 : 0))
     .map(([variant_id, quantity]) => ({ variant_id, quantity }))

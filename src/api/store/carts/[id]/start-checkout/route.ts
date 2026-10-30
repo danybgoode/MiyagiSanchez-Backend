@@ -483,6 +483,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // Payment links (S4, D15): the server's `payment_link_cart` record, same rule.
   const linkCart = serverClaim ? null : await linkCartFor(req.scope, cartId)
   const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? 'in_person' : linkCart ? 'payment_link' : null
+  let linkUses: string | null = null
+  let linkIdForHold: string | null = null
   if (linkCart) {
     // One checkout per link cart — the pay page builds a fresh cart per attempt.
     if (await cartHasPaymentCollection(req, cartId)) {
@@ -524,16 +526,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // at once would both be charged (codex, both lenses, PR 221). The hold is atomic and
     // lasts the checkout's own lifetime (COUNTER_CHECKOUT_TTL_MS, which link checkouts
     // also get below), so an abandoned attempt frees the link by itself.
-    if (lk.uses === 'single' && !(await holdSingleUseLink(req.scope, lk.id, cartId, COUNTER_CHECKOUT_TTL_MS))) {
-      return res.status(409).json({ code: 'LINK_BUSY', message: 'Alguien está pagando este cobro. Intenta de nuevo en unos minutos.' })
-    }
-    // ONE checkout per link cart, ever — taken atomically. Two concurrent start-checkout
-    // calls for the same cart both passed the collection check and could open two
-    // provider checkouts (codex security lens, PR 221). A link cart is disposable: the
-    // pay page builds a fresh one for every new attempt.
-    if (!(await claimLinkCartCheckout(req.scope, cartId))) {
-      return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
-    }
+    linkUses = lk.uses
+    linkIdForHold = lk.id
     body.fulfillment_method = lk?.kind === 'amount' ? 'digital' : 'local_pickup'
   }
   if (serverCartSource === 'in_person') {
@@ -1337,7 +1331,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
   // ── Create Medusa PaymentCollection + PaymentSession ─────────────────────
   // ── Counter: one checkout, fenced (D8/D9) ──────────────────────────────────
-  const counterRef = isCounterCart
+  const counterRef = serverCartSource
     ? (providerId === 'pp_stripe-connect_stripe-connect' ? (providerData.stripe_session_id as string | undefined)
       : providerId === 'pp_mercadopago_mercadopago' ? (providerData.mp_preference_id as string | undefined)
       : 'manual')
@@ -1357,6 +1351,23 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       return serverClaim!.status !== 'awaiting_payment'
         ? res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
         : res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+    }
+  }
+  if (linkCart) {
+    // Taken only NOW, after every validation and with the provider checkout created —
+    // a request refused for any reason above holds nothing, so a buyer cannot keep a
+    // link busy with failing requests (codex security lens, PR 221 round 3). Whoever
+    // loses either race expires the checkout it just created.
+    //  · ONE checkout per link cart, ever: two concurrent starts on one cart cannot both
+    //    open a provider checkout (the pay page builds a fresh cart per attempt).
+    //  · ONE payable checkout per SINGLE-use link at a time, for the checkout's lifetime.
+    if (!(await claimLinkCartCheckout(req.scope, cartId))) {
+      await expireCreated()
+      return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+    }
+    if (linkUses === 'single' && !(await holdSingleUseLink(req.scope, linkIdForHold!, cartId, COUNTER_CHECKOUT_TTL_MS))) {
+      await expireCreated()
+      return res.status(409).json({ code: 'LINK_BUSY', message: 'Alguien está pagando este cobro. Intenta de nuevo en unos minutos.' })
     }
   }
 
@@ -1465,6 +1476,16 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     return res.json(responseBody)
   } catch (e) {
     console.error('[start-checkout] Medusa payment session error:', e)
+    if (linkCart) {
+      // This cart's checkout failed: its provider checkout must not stay payable, and a
+      // single-use link must not stay held for 31 minutes by a dead attempt.
+      await expireCreated()
+      await req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION).raw(
+        `update payment_link set metadata = metadata - 'hold_cart_id' - 'hold_until', updated_at = now()
+          where id = ? and metadata->>'hold_cart_id' = ?`,
+        [String(linkCart.payment_link_id), cartId],
+      ).catch(() => {})
+    }
     if (isCounterCart && counterMark) {
       await expireCreated()
       // Unlink a collection this failed attempt attached, or the next attempt would be

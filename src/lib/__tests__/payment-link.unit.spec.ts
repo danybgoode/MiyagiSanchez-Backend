@@ -32,6 +32,7 @@ describe('validatePaymentLinkInput', () => {
     [{ kind: 'amount', concept: 'ok concept', amount_cents: 5000, uses: 'multi' }, 'INVALID_USES'],
     [{ kind: 'products', lines: [] }, 'EMPTY_LINK'],
     [{ kind: 'products', lines: [{ variant_id: 'a', quantity: 0 }] }, 'INVALID_QUANTITY'],
+    [{ kind: 'products', lines: [{ variant_id: 'a', quantity: 600 }, { variant_id: 'a', quantity: 600 }] }, 'INVALID_QUANTITY'],
     [{ kind: 'products', lines: [{ variant_id: 'a' }], expires_in_days: LINK_MAX_DAYS + 1 }, 'INVALID_EXPIRY'],
     [{ kind: 'products', lines: [{ variant_id: 'a' }], expires_in_days: 0 }, 'INVALID_EXPIRY'],
   ])('refuses %j with %s', (body, code) => {
