@@ -194,6 +194,15 @@ async function captureCash(scope: Scope, orderId: string, cash: { tendered_cents
   })
 }
 
+/** Cash facts already stamped on an order by an earlier attempt, or null if none were. */
+async function orderCashFacts(scope: Scope, orderId: string): Promise<{ tendered_cents: number | null; change_cents: number } | null> {
+  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'order', fields: ['id', 'metadata'], filters: { id: orderId } })
+  const ip = ((data?.[0] as any)?.metadata?.in_person ?? {}) as Record<string, unknown>
+  if (typeof ip.change_cents !== 'number') return null
+  return { tendered_cents: typeof ip.tendered_cents === 'number' ? ip.tendered_cents : null, change_cents: ip.change_cents }
+}
+
 /** The order this cart already became, if any (Medusa's own `order_cart` link). */
 async function orderForCart(scope: Scope, cartId: string): Promise<string | null> {
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
@@ -430,15 +439,20 @@ export async function recordInPersonSale(
     const { result: completed } = await completeCartWorkflow(scope as any).run({ input: { id: cartId } })
     const orderId = (completed as any).id as string
     const total = await orderTotalCents(scope, orderId)
-    const { change_cents } = cashChange(total, sale.tendered_cents)
-    await captureCash(scope, orderId, { tendered_cents: sale.tendered_cents, change_cents })
+    // A RESUMED order already carries the cash facts of the sale that was handed over;
+    // those win over this retry's amount (codex re-review, #214). Only a fresh order
+    // takes its change from this request.
+    const stored = priorOrderId ? await orderCashFacts(scope, orderId) : null
+    const tendered_cents = stored ? stored.tendered_cents : sale.tendered_cents
+    const change_cents = stored ? stored.change_cents : cashChange(total, sale.tendered_cents).change_cents
+    await captureCash(scope, orderId, { tendered_cents, change_cents })
     // Unconditional on purpose: two owners can only ever complete the SAME recorded
     // cart, which Medusa resolves to the same order, so both write identical facts.
     await inPerson.updateInPersonSales({
       id: claimId,
       status: 'completed',
       order_id: orderId,
-      metadata: { tendered_cents: sale.tendered_cents, change_cents, total_cents: total },
+      metadata: { tendered_cents, change_cents, total_cents: total },
     })
     return { ok: true, status: replayed ? 200 : 201, body: { order_id: orderId, total_cents: total, change_cents, replayed } }
   } catch (e) {
