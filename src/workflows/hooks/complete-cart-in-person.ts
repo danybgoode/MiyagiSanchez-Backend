@@ -53,18 +53,13 @@ async function validatePaymentLinkCart(container: any, inPerson: any, cart: any,
     // (codex security lens, PR 221 round 6).
     const productIds = Array.from(new Set(((cart?.items ?? []) as any[]).map((i) => i?.product_id).filter(Boolean)))
     if (productIds.length) {
-      let hidden = false
-      try {
-        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
-          entity: 'product', fields: ['id', 'metadata'], filters: { id: productIds },
-        })
-        hidden = ((data ?? []) as any[]).some((p) => p?.metadata?.is_payment_link_product === true)
-      } catch (e) {
-        // This runs on EVERY cart completion in the shop: a lookup failure must not stop
-        // all checkouts. The worst a miss allows is the hidden product sold at its base
-        // price to its own seller — so this fails OPEN, loudly.
-        console.error('[complete-cart-in-person] hidden-product check unavailable', cartId, (e as Error)?.message)
-      }
+      // Fail CLOSED (codex, PR 221 rounds 7–9): if this one lookup fails, cart completion's
+      // own dozens of queries are failing too, so refusing adds no real availability risk —
+      // while allowing would let the hidden product sell at its base price.
+      const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+        entity: 'product', fields: ['id', 'metadata'], filters: { id: productIds },
+      })
+      const hidden = ((data ?? []) as any[]).some((p) => p?.metadata?.is_payment_link_product === true)
       if (hidden) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This product is payable only through its payment link.')
     }
     return
