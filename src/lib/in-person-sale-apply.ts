@@ -13,9 +13,9 @@
  * `completeCartWorkflow` returns that cart's existing order (it reads `order_cart`
  * first — confirmed in the installed core-flows 2.21.2), never a second order.
  */
+import { randomUUID } from 'node:crypto'
 import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
 import {
-  addShippingMethodToCartWorkflow,
   capturePaymentWorkflow,
   completeCartWorkflow,
   createCartWorkflow,
@@ -123,9 +123,16 @@ async function prepareCartForCash(scope: Scope, cartId: string): Promise<number>
     const optionIds = await resolveShippingOptionIds(scope)
     const optionId = optionIds.pickup ?? optionIds.coord
     if (!optionId) throw new Error('no seeded pickup/coord shipping option — run /internal/setup-fulfillment')
-    await addShippingMethodToCartWorkflow(scope as any).run({
-      input: { cart_id: cartId, options: [{ id: optionId }] },
-    })
+    // Direct module call with an explicit $0 amount, exactly as start-checkout's live
+    // path does: `addShippingMethodToCartWorkflow` asks the provider to PRICE the
+    // option, and the manual fulfillment provider refuses ("Manual fulfillment does
+    // not support price calculation" — the money-path CI run of PR #214).
+    await scope.resolve(Modules.CART).addShippingMethods(cartId, [{
+      name: 'Entregado en persona',
+      amount: 0,
+      shipping_option_id: optionId,
+      data: {},
+    }])
   }
 
   let collectionId = await cartPaymentCollectionId(scope, cartId)
@@ -190,9 +197,67 @@ async function orderTotalCents(scope: Scope, orderId: string): Promise<number> {
   return Math.round(Number((data?.[0] as any)?.total ?? 0))
 }
 
+/**
+ * The claim insert hit the unique index. Medusa's service layer re-throws Postgres'
+ * 23505 as its own `MedusaError` of type `duplicate_error` ("… already exists"), so
+ * the raw-code check alone never matched — the money-path CI run of PR #214 proved
+ * it: a concurrent replay surfaced as an unhandled error instead of a replay.
+ */
+function isDuplicateClaimError(e: unknown): boolean {
+  return isUniqueViolationError(e) || (e as { type?: string } | null)?.type === 'duplicate_error'
+}
+
 function isStockError(e: unknown): boolean {
   const msg = String((e as Error)?.message ?? e)
   return /inventory|stock|required quantity/i.test(msg)
+}
+
+// ── Conditional claim writes ─────────────────────────────────────────────────────
+// Raw SQL on purpose: the generated service `update` cannot say "only if I still own
+// it", and every one of these writes is meaningless unless it can. Each returns
+// whether THIS caller's write landed (LEARNINGS: a read is not a claim — make the
+// write conditional and read the result back).
+
+function knexOf(scope: Scope): any {
+  return scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+}
+
+/** Take over a claim judged stale. Wins only if nobody re-stamped it since we read it. */
+async function takeOverClaim(
+  scope: Scope,
+  claimId: string,
+  seenToken: string,
+  newToken: string,
+  now: Date,
+): Promise<{ cart_id: string | null } | null> {
+  const res = await knexOf(scope).raw(
+    `update in_person_sale set claim_token = ?, claimed_at = ?, updated_at = now()
+      where id = ? and claim_token = ? and status = 'claimed' and deleted_at is null
+      returning cart_id`,
+    [newToken, now, claimId, seenToken],
+  )
+  const row = res?.rows?.[0]
+  return row ? { cart_id: row.cart_id ?? null } : null
+}
+
+/** Record the cart this owner built. Fails if ownership moved, or a cart is already recorded. */
+async function recordClaimCart(scope: Scope, claimId: string, token: string, cartId: string): Promise<boolean> {
+  const res = await knexOf(scope).raw(
+    `update in_person_sale set cart_id = ?, updated_at = now()
+      where id = ? and claim_token = ? and cart_id is null and deleted_at is null
+      returning id`,
+    [cartId, claimId, token],
+  )
+  return (res?.rows?.length ?? 0) > 0
+}
+
+/** Make the claim immediately stale so the next resend takes it over (still owner-conditional). */
+async function releaseClaim(scope: Scope, claimId: string, token: string): Promise<void> {
+  await knexOf(scope).raw(
+    `update in_person_sale set claimed_at = to_timestamp(0), updated_at = now()
+      where id = ? and claim_token = ? and status = 'claimed'`,
+    [claimId, token],
+  )
 }
 
 /**
@@ -233,6 +298,7 @@ export async function recordInPersonSale(
   // ── claim ────────────────────────────────────────────────────────────────────
   const inPerson = scope.resolve(IN_PERSON_MODULE)
   const payloadHash = inPersonPayloadHash(sale)
+  const token = randomUUID()
   let claimId: string
   let existingCartId: string | null = null
   let replayed = false
@@ -245,10 +311,11 @@ export async function recordInPersonSale(
       payload_hash: payloadHash,
       offline: sale.offline,
       claimed_at: now,
+      claim_token: token,
     })
     claimId = row.id
   } catch (e) {
-    if (!isUniqueViolationError(e)) throw e
+    if (!isDuplicateClaimError(e)) throw e
     const [existing] = await inPerson.listInPersonSales({ seller_id: sellerId, client_id: sale.client_id })
     if (!existing) throw e
     const outcome = decideExistingClaim(existing, payloadHash, now)
@@ -261,7 +328,9 @@ export async function recordInPersonSale(
           body: {
             order_id: outcome.order_id,
             total_cents: total,
-            change_cents: cashChange(total, sale.tendered_cents).change_cents,
+            // The change of the sale that was CAPTURED, stored at completion — not
+            // recomputed from this retry's amount, which may differ (cross-review #214).
+            change_cents: Number((existing.metadata as any)?.change_cents ?? 0),
             replayed: true,
           },
         }
@@ -273,10 +342,12 @@ export async function recordInPersonSale(
       case 'in_progress':
         return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
       case 'takeover': {
-        // Re-stamp claimed_at so a third caller sees an in-flight claim, not a stale one.
-        await inPerson.updateInPersonSales({ id: existing.id, claimed_at: now })
+        // Conditional on the token we READ: of two callers that both judged this claim
+        // stale, exactly one wins; the other is told the sale is in progress.
+        const won = await takeOverClaim(scope, existing.id, existing.claim_token, token, now)
+        if (!won) return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
         claimId = existing.id
-        existingCartId = outcome.cart_id
+        existingCartId = won.cart_id
         replayed = true
         break
       }
@@ -310,8 +381,14 @@ export async function recordInPersonSale(
           },
         },
       })
-      cartId = (cart as any).id as string
-      await inPerson.updateInPersonSales({ id: claimId, cart_id: cartId })
+      const builtCartId = (cart as any).id as string
+      // If ownership moved while we built the cart (we were slow past the stale window
+      // and someone took over), our cart is abandoned uncompleted — the new owner's
+      // cart is the sale. Abandoned carts hold no reservation and no payment.
+      if (!(await recordClaimCart(scope, claimId, token, builtCartId))) {
+        return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
+      }
+      cartId = builtCartId
     }
 
     const amountCents = await prepareCartForCash(scope, cartId)
@@ -319,16 +396,22 @@ export async function recordInPersonSale(
       // Refused before the order exists. The claim is released, not failed: the
       // payload hash excludes the cash amount on purpose, so a resend with the
       // corrected amount takes the claim over and completes the same cart.
-      await inPerson.updateInPersonSales({ id: claimId, claimed_at: new Date(0) })
+      await releaseClaim(scope, claimId, token)
       return refuse(422, 'TENDERED_SHORT', 'El efectivo recibido no cubre el total.', { total_cents: amountCents })
     }
     const { result: completed } = await completeCartWorkflow(scope as any).run({ input: { id: cartId } })
     const orderId = (completed as any).id as string
     await captureCash(scope, orderId)
-    await inPerson.updateInPersonSales({ id: claimId, status: 'completed', order_id: orderId })
-
     const total = await orderTotalCents(scope, orderId)
     const { change_cents } = cashChange(total, sale.tendered_cents)
+    // Unconditional on purpose: two owners can only ever complete the SAME recorded
+    // cart, which Medusa resolves to the same order, so both write identical facts.
+    await inPerson.updateInPersonSales({
+      id: claimId,
+      status: 'completed',
+      order_id: orderId,
+      metadata: { tendered_cents: sale.tendered_cents, change_cents, total_cents: total },
+    })
     return { ok: true, status: replayed ? 200 : 201, body: { order_id: orderId, total_cents: total, change_cents, replayed } }
   } catch (e) {
     if (isStockError(e)) {
@@ -339,7 +422,7 @@ export async function recordInPersonSale(
     }
     // Transient: release the claim (stale now) so an immediate retry takes it over
     // and resumes the recorded cart instead of waiting out the stale window.
-    await inPerson.updateInPersonSales({ id: claimId, claimed_at: new Date(0) }).catch(() => {})
+    await releaseClaim(scope, claimId, token).catch(() => {})
     throw e
   }
 }

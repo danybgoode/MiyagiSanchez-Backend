@@ -150,6 +150,7 @@ export interface ExistingClaim {
   order_id: string | null
   cart_id: string | null
   claimed_at: Date | string
+  claim_token?: string
 }
 
 export type ClaimOutcome =

@@ -28,6 +28,13 @@ const InPersonSale = model
     oversold: model.boolean().default(false),
     /** When the current owner took the claim; a claim older than the stale window may be taken over. */
     claimed_at: model.dateTime(),
+    /**
+     * Random per-owner token. Every write that advances a claim (take it over,
+     * record its cart) is conditional on still holding this token, so two callers
+     * that both judged one claim stale cannot both act on it — the unique index
+     * stops duplicate ROWS, this stops duplicate OWNERS (cross-review, PR #214).
+     */
+    claim_token: model.text(),
     metadata: model.json().nullable(),
   })
   .indexes([

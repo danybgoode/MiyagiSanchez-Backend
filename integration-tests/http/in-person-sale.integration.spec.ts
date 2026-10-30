@@ -97,7 +97,7 @@ medusaIntegrationTestRunner({
         await setupFulfillmentInfrastructure(container as any)
         const [profile] = await container.resolve(Modules.FULFILLMENT).listShippingProfiles({ type: 'default' })
 
-        const sellers = container.resolve(SELLER_MODULE)
+        const sellers: any = container.resolve(SELLER_MODULE)
         const [mine, theirs] = await sellers.createSellers([
           { slug: 'puesto-de-ana', name: 'Puesto de Ana', clerk_user_id: 'user_ana', metadata: { operating_market: 'mx' } },
           { slug: 'otra-tienda', name: 'Otra tienda', clerk_user_id: 'user_otra', metadata: { operating_market: 'mx' } },
@@ -155,6 +155,8 @@ medusaIntegrationTestRunner({
         expect(again.body.order_id).toBe(first.body.order_id)
         expect(again.body.replayed).toBe(true)
         expect(again.status).toBe(200)
+        // The change of the captured sale, not of this retry's amount.
+        expect(again.body.change_cents).toBe(first.body.change_cents)
         expect(await getProductAvailableQuantity(container as any, productId)).toBe(3)
       })
 
@@ -173,8 +175,31 @@ medusaIntegrationTestRunner({
           if (r.ok) expect(r.body.order_id).toBe((created[0] as any).body.order_id)
           else expect(r.code).toBe('IN_PROGRESS')
         }
-        const claims = await container.resolve(IN_PERSON_MODULE).listInPersonSales({ seller_id: sellerId, client_id: s.client_id })
+        const claims = await (container.resolve(IN_PERSON_MODULE) as any).listInPersonSales({ seller_id: sellerId, client_id: s.client_id })
         expect(claims).toHaveLength(1)
+        expect(await getProductAvailableQuantity(container as any, productId)).toBe(3)
+      })
+
+      it('two retries that both find ONE stale claim make exactly one order (cross-review #214)', async () => {
+        const container = getContainer()
+        const s = sale()
+        // A claim whose owner died before building a cart: stale, no cart recorded.
+        await (container.resolve(IN_PERSON_MODULE) as any).createInPersonSales({
+          seller_id: sellerId,
+          client_id: s.client_id,
+          kind: 'cash',
+          status: 'claimed',
+          payload_hash: require('../../src/lib/in-person-sale').inPersonPayloadHash(s),
+          claimed_at: new Date(0),
+          claim_token: 'dead-owner',
+        })
+        const results = await Promise.all([
+          recordInPersonSale(container as any, sellerId, s),
+          recordInPersonSale(container as any, sellerId, s),
+        ])
+        const succeeded = results.filter((r) => r.ok)
+        expect(succeeded).toHaveLength(1)
+        for (const r of results) if (!r.ok) expect(r.code).toBe('IN_PROGRESS')
         expect(await getProductAvailableQuantity(container as any, productId)).toBe(3)
       })
 
@@ -193,7 +218,7 @@ medusaIntegrationTestRunner({
         expect(r.ok).toBe(false)
         expect(!r.ok && r.code).toBe('VARIANT_NOT_OWNED')
         expect(!r.ok && (r.details as any).variant_ids).toEqual([otherVariantId])
-        const claims = await container.resolve(IN_PERSON_MODULE).listInPersonSales({ seller_id: sellerId })
+        const claims = await (container.resolve(IN_PERSON_MODULE) as any).listInPersonSales({ seller_id: sellerId })
         expect(claims).toHaveLength(0)
       })
 
