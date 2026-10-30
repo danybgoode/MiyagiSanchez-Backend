@@ -25,7 +25,7 @@ import { SELLER_MODULE } from '../modules/seller'
 import { resolveSellerProductIds } from '../api/store/_utils/seller-catalog-query'
 import { isHiddenCatalogProduct, isSupportProductMetadata } from '../api/store/_utils/support'
 import { captureOrderPayment } from './order-payment-capture'
-import { recordOversoldOfflineSale } from './in-person-sale-oversold'
+import { OversoldOwnershipLost, recordOversoldOfflineSale } from './in-person-sale-oversold'
 import { getInPersonSaleStatus, type InPersonSaleState } from './in-person-sale-status'
 import { resolveShippingOptionIds } from '../api/store/_utils/fulfillment'
 import { readSellerOperatingMarket } from './seller-market'
@@ -528,6 +528,7 @@ export async function recordInPersonSale(
           sellerId, sale, regionId, channelId,
           email: PLACEHOLDER_BUYER_EMAIL,
           soldAt: sale.sold_at ?? now.toISOString(),
+          claimId, claimToken: token,
         })
         const { change_cents } = cashChange(totalCents, sale.tendered_cents)
         await inPerson.updateInPersonSales({
@@ -539,6 +540,9 @@ export async function recordInPersonSale(
         })
         return { ok: true, status: 201, body: { order_id: orderId, total_cents: totalCents, change_cents, replayed: false } }
       } catch (fallbackError) {
+        if (fallbackError instanceof OversoldOwnershipLost) {
+          return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
+        }
         // Not a refusal: the sale happened. Keep the claim retryable (the queue resends).
         await releaseClaim(scope, claimId, token).catch(() => {})
         console.error('[in-person] offline oversell fallback failed', { claimId, message: (fallbackError as Error)?.message })

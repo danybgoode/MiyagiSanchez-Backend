@@ -27,6 +27,7 @@ describe('inventory-writer population is closed over market admission', () => {
       'src/api/internal/backfill-inventory/route.ts',
       'src/api/store/_utils/seller-product-create.ts',
       'src/api/store/_utils/seller-product-update.ts',
+      'src/lib/in-person-sale-oversold.ts',
       'src/lib/ml-fulfillment-apply.ts',
       'src/lib/ml-order-cancel-apply.ts',
       'src/lib/ml-sync-apply.ts',
@@ -37,6 +38,16 @@ describe('inventory-writer population is closed over market admission', () => {
     for (const file of users.filter((name) => name.includes('/ml-'))) {
       expect(readFileSync(join(process.cwd(), file), 'utf8')).toMatch(/isMxSeller\(/)
     }
+  })
+
+  it('keeps the counter oversell writer MX-only: it is reached only after the seller is proved MX', () => {
+    // in-person-sales D1/D12: recordInPersonSale refuses a non-MX seller before any claim,
+    // and the oversell fallback is called only from inside it.
+    const apply = readFileSync(join(process.cwd(), 'src/lib/in-person-sale-apply.ts'), 'utf8')
+    expect(apply).toMatch(/readSellerOperatingMarket\(seller\)\.market !== 'mx'/)
+    expect(apply).toMatch(/IN_PERSON_MX_ONLY/)
+    const oversold = readFileSync(join(process.cwd(), 'src/lib/in-person-sale-oversold.ts'), 'utf8')
+    expect(oversold).toMatch(/resolveStockLocationId\(scope, 'mx'\)/)
   })
 
   it('keeps the repair backfill ownership-scoped with no Store-default fallback', () => {
