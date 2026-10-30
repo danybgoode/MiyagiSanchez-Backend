@@ -32,6 +32,8 @@ import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupp
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
 import { resolveRentalCheckout, type RentalBooking } from '../../../../../lib/rental-checkout'
 import {
+  readStripePaymentContext,
+  stripeRequestOptions,
   buildStripePaymentContext,
   checkoutRefusalResponse,
   planStripeMarketStrategy,
@@ -1285,16 +1287,27 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
     // Patch the Stripe session metadata with the Medusa session ID (for webhook correlation)
     if (body.provider === 'stripe' && providerData.stripe_session_id) {
-      // Best-effort — non-fatal if Stripe API call fails
+      // REQUIRED, not best-effort: the stripe-connect provider authorizes only a Checkout
+      // Session whose `metadata.medusa_payment_session_id` is THIS payment session
+      // (src/lib/stripe-authorization.ts — the binding that stops one paid session being
+      // replayed onto another cart). A session we cannot bind could take the buyer's
+      // money and never become an order, so it is expired and the checkout refused.
+      // Request options address the account the session lives on (US direct charges are
+      // on the seller's connected account; the old platform-only update failed there).
+      const stripeCtx = readStripePaymentContext(providerData)
+      const stripeOpts = stripeCtx ? stripeRequestOptions(stripeCtx) : undefined
+      const stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-09-30.clover' as any })
       try {
-        const stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-09-30.clover' as any })
         await stripeClient.checkout.sessions.update(providerData.stripe_session_id as string, {
           metadata: {
             cart_id: cartId,
             medusa_payment_session_id: paymentSession.id,
           },
-        })
-      } catch { /* non-fatal */ }
+        }, stripeOpts)
+      } catch (bindError) {
+        await stripeClient.checkout.sessions.expire(providerData.stripe_session_id as string, {}, stripeOpts).catch(() => {})
+        throw bindError
+      }
     }
 
     // Link the payment collection to the cart. cart ↔ payment_collection is a
