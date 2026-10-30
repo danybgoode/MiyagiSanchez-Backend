@@ -22,6 +22,13 @@ completeCartWorkflow.hooks.validate(async ({ cart }, { container }) => {
   const inPerson: any = container.resolve(IN_PERSON_MODULE)
   const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
   if (!claim) return
+  // A closed sale cannot become an order — except a CARD sale, whose provider authorizes
+  // only a payment the processor confirmed: money already taken must still become its
+  // order (never hidden). Transfer/cash authorize unconditionally, so after a cancel
+  // they would mint a pending order the merchant closed (codex security lens, PR 218).
+  if ((claim.status === 'cancelled' || claim.status === 'failed') && claim.kind !== 'card') {
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This counter sale was closed.')
+  }
   const sessions = (((cart as any)?.payment_collection?.payment_sessions ?? []) as Array<{ provider_id?: string; status?: string }>)
     .filter((s) => PROCESSABLE.has(String(s?.status)))
     .map((s) => String(s?.provider_id))

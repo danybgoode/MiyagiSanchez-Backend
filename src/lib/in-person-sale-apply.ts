@@ -25,6 +25,7 @@ import { SELLER_MODULE } from '../modules/seller'
 import { resolveSellerProductIds } from '../api/store/_utils/seller-catalog-query'
 import { isHiddenCatalogProduct, isSupportProductMetadata } from '../api/store/_utils/support'
 import { captureOrderPayment } from './order-payment-capture'
+import { getInPersonSaleStatus, type InPersonSaleState } from './in-person-sale-status'
 import { resolveShippingOptionIds } from '../api/store/_utils/fulfillment'
 import { readSellerOperatingMarket } from './seller-market'
 import { sellerRowEnforcement } from './seller-status'
@@ -62,7 +63,7 @@ export type RecordResult =
         replayed: boolean
         /** Card/transfer (S2): the cart the checkout runs on, and the claim's state. */
         cart_id?: string
-        status?: 'completed' | 'awaiting_payment'
+        status?: InPersonSaleState
         checkout_url?: string | null
       }
     }
@@ -307,35 +308,27 @@ async function releaseClaim(scope: Scope, claimId: string, token: string): Promi
   )
 }
 
-async function checkoutUrlOfCart(scope: Scope, cartId: string): Promise<string | null> {
-  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
-  const { data } = await query.graph({
-    entity: 'cart',
-    fields: ['id', 'payment_collection.payment_sessions.data'],
-    filters: { id: cartId },
-  })
-  const sessions = ((data?.[0] as any)?.payment_collection?.payment_sessions ?? []) as any[]
-  const url = sessions[sessions.length - 1]?.data?.redirect_url
-  return typeof url === 'string' ? url : null
-}
-
-/** The answer for a card/transfer sale whose cart is built (fresh, resumed or replayed). */
+/**
+ * The answer for a card/transfer sale whose cart is built (fresh, resumed or replayed).
+ * The STATE comes from the status read — the cart may already have become an order (a
+ * buyer who paid before this resend), and a replay must never report a paid sale as
+ * waiting (codex, PR 218).
+ */
 async function awaitingResult(scope: Scope, claim: any, status: 200 | 201, replayed: boolean): Promise<RecordResult> {
-  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
-  const { data } = await query.graph({ entity: 'cart', fields: ['id', 'total'], filters: { id: claim.cart_id } })
+  const st = await getInPersonSaleStatus(scope, claim.seller_id, claim.client_id)
   return {
     ok: true,
     status,
     body: {
-      order_id: claim.order_id ?? null,
-      total_cents: Math.round(Number((data?.[0] as any)?.total ?? 0)),
+      order_id: st?.order_id ?? claim.order_id ?? null,
+      total_cents: st?.total_cents ?? 0,
       change_cents: 0,
       replayed,
       cart_id: claim.cart_id,
-      status: 'awaiting_payment',
+      status: st?.state ?? 'awaiting_payment',
       // Read back from the payment session start-checkout opened — never stored from,
       // or trusted to, a client (verifier, PR 218).
-      checkout_url: await checkoutUrlOfCart(scope, claim.cart_id),
+      checkout_url: st?.checkout_url ?? null,
     },
   }
 }

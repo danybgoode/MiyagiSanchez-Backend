@@ -89,7 +89,7 @@ export function inPersonSaleSuite(getContainer: () => any) {
         // writes; the module's createRegions silently ignores it. The provider must be
         // enabled in the region or completeCartWorkflow refuses the session (as live).
         const { result: [region] } = await createRegionsWorkflow(container).run({
-          input: { regions: [{ name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_cash_cash'] }] },
+          input: { regions: [{ name: 'México', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_cash_cash', 'pp_manual_manual'] }] },
         })
         const [channel] = await container.resolve(Modules.SALES_CHANNEL).createSalesChannels([{ name: 'MX operating' }])
         channelId = channel.id
@@ -348,6 +348,27 @@ export function inPersonSaleSuite(getContainer: () => any) {
             where cart_id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null returning id`,
           [r2.body.cart_id])
         expect(open.rows).toHaveLength(0)
+      })
+
+      it('a CANCELLED transfer cannot be completed into an order afterwards (codex security lens, PR 218)', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'transfer', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        const c = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(c.ok && c.status.state).toBe('cancelled')
+        const cartId = r.body.cart_id!
+        await container.resolve(Modules.CART).addShippingMethods(cartId, [{
+          name: 'Entregado en persona', amount: 0,
+          shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cartId } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_manual_manual', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        let refused: string | null = null
+        try { await completeCartWorkflow(container).run({ input: { id: cartId } }) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/was closed/)
       })
 
       it('an unpaid card sale cancels, and a cancelled sale cannot be resent', async () => {
