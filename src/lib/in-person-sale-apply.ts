@@ -474,7 +474,20 @@ export async function recordInPersonSale(
       // D9/D10: card and transfer stop here — the cart is the sale; the shop's own
       // checkout (start-checkout) takes the payment and the webhook / «Ya me llegó»
       // completes it. `awaiting_payment` is settled: a resend returns this same cart.
-      await inPerson.updateInPersonSales({ id: claimId, status: 'awaiting_payment' })
+      // Record the server-computed total WITH the state change: start-checkout and the
+      // completeCart hook refuse a cart whose lines or total no longer match it (a
+      // promotion or a line edit through the public cart routes — codex, PR 218).
+      const { data: priced } = await scope.resolve(ContainerRegistrationKeys.QUERY).graph({
+        entity: 'cart', fields: ['id', 'total'], filters: { id: cartId },
+      })
+      await knexOf(scope).raw(
+        `update in_person_sale
+            set status = 'awaiting_payment',
+                metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('total_cents', ?::int),
+                updated_at = now()
+          where id = ? and status = 'claimed'`,
+        [Math.round(Number((priced?.[0] as any)?.total ?? 0)), claimId],
+      )
       const [row] = await inPerson.listInPersonSales({ id: claimId })
       return awaitingResult(scope, row, existingCartId ? 200 : 201, Boolean(existingCartId))
     }

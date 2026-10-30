@@ -203,3 +203,31 @@ export function disallowedCounterProviders(kind: string, providerIds: string[]):
   if (!allowed) return [...providerIds]
   return providerIds.filter((id) => !allowed.has(id))
 }
+
+/**
+ * Does a cart still hold exactly the sale its claim recorded? Lines are compared by the
+ * same canonical hash as the claim (merged by variant, sorted); the total — when the
+ * claim recorded one — must match to the centavo, which also catches a promotion code
+ * added through the public cart routes (codex security lens, PR 218).
+ */
+export function counterCartMatchesClaim(
+  cart: { total?: unknown; items: Array<{ variant_id?: string | null; quantity?: unknown }> },
+  claim: { kind: string; payload_hash: string; total_cents?: unknown },
+): boolean {
+  const merged = new Map<string, number>()
+  for (const it of cart.items ?? []) {
+    const v = typeof it?.variant_id === 'string' ? it.variant_id : ''
+    const q = Number(it?.quantity)
+    if (!v || !Number.isInteger(q) || q < 1) return false
+    merged.set(v, (merged.get(v) ?? 0) + q)
+  }
+  if (merged.size === 0) return false
+  const lines = [...merged.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([variant_id, quantity]) => ({ variant_id, quantity }))
+  if (inPersonPayloadHash({ kind: claim.kind as InPersonSaleKind, lines }) !== claim.payload_hash) return false
+  if (typeof claim.total_cents === 'number') {
+    return Math.round(Number(cart.total ?? NaN)) === claim.total_cents
+  }
+  return true
+}

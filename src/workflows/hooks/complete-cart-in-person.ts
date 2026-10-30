@@ -12,7 +12,7 @@
 import { completeCartWorkflow } from '@medusajs/medusa/core-flows'
 import { MedusaError } from '@medusajs/framework/utils'
 import { IN_PERSON_MODULE } from '../../modules/in-person'
-import { disallowedCounterProviders } from '../../lib/in-person-sale'
+import { counterCartMatchesClaim, disallowedCounterProviders } from '../../lib/in-person-sale'
 
 const PROCESSABLE = new Set(['pending', 'requires_more', 'authorized', 'captured', 'pending_authorization'])
 
@@ -25,6 +25,13 @@ completeCartWorkflow.hooks.validate(async ({ cart }, { container }) => {
   const sessions = (((cart as any)?.payment_collection?.payment_sessions ?? []) as Array<{ provider_id?: string; status?: string }>)
     .filter((s) => PROCESSABLE.has(String(s?.status)))
     .map((s) => String(s?.provider_id))
+  // The cart must still be the sale the merchant rang up (lines + recorded total).
+  if (!counterCartMatchesClaim(
+    { total: (cart as any)?.total, items: ((cart as any)?.items ?? []) as any[] },
+    { kind: String(claim.kind), payload_hash: String(claim.payload_hash), total_cents: (claim.metadata as any)?.total_cents },
+  )) {
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This counter sale changed after it was rung up.')
+  }
   const refused = disallowedCounterProviders(String(claim.kind), sessions)
   if (refused.length) {
     throw new MedusaError(

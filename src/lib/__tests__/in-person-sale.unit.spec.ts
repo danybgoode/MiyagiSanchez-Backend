@@ -177,3 +177,31 @@ describe('disallowedCounterProviders (codex security lens, PR 218)', () => {
     expect(disallowedCounterProviders('barter', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
   })
 })
+
+describe('counterCartMatchesClaim (codex security lens, PR 218)', () => {
+  const { counterCartMatchesClaim, inPersonPayloadHash } = require('../in-person-sale')
+  const lines = [{ variant_id: 'variant_a', quantity: 2 }, { variant_id: 'variant_b', quantity: 1 }]
+  const claim = { kind: 'card', payload_hash: inPersonPayloadHash({ kind: 'card', lines }), total_cents: 45000 }
+  const cart = (over: Record<string, unknown> = {}) => ({
+    total: 45000,
+    items: [{ variant_id: 'variant_b', quantity: 1 }, { variant_id: 'variant_a', quantity: 1 }, { variant_id: 'variant_a', quantity: 1 }],
+    ...over,
+  })
+
+  it('the cart the merchant rang up matches (lines merged and sorted)', () => {
+    expect(counterCartMatchesClaim(cart(), claim)).toBe(true)
+  })
+  it('a removed or reduced line does not match', () => {
+    expect(counterCartMatchesClaim(cart({ items: [{ variant_id: 'variant_a', quantity: 2 }] }), claim)).toBe(false)
+    expect(counterCartMatchesClaim(cart({ items: [{ variant_id: 'variant_a', quantity: 1 }, { variant_id: 'variant_b', quantity: 1 }] }), claim)).toBe(false)
+  })
+  it('a lower total (a promotion) does not match', () => {
+    expect(counterCartMatchesClaim(cart({ total: 1 }), claim)).toBe(false)
+  })
+  it('with no recorded total only the lines are compared (cash)', () => {
+    expect(counterCartMatchesClaim(cart({ total: 1 }), { ...claim, total_cents: undefined })).toBe(true)
+  })
+  it('an empty cart never matches', () => {
+    expect(counterCartMatchesClaim(cart({ items: [] }), claim)).toBe(false)
+  })
+})

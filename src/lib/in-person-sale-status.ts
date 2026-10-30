@@ -195,7 +195,15 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
         return { ok: false, status: 409, code: 'IN_PROGRESS', message: 'El cobro se está abriendo. Intenta en un momento.' }
       }
     } else {
-      const { session } = await cartCheckout(scope, claim.cart_id)
+      const recordedProvider = (claim.metadata as any)?.checkout_provider as string | undefined
+      const recordedRef = (claim.metadata as any)?.checkout_ref as string | undefined
+      const { session: currentSession } = await cartCheckout(scope, claim.cart_id)
+      // The checkout this sale OPENED is the server's own record (start-checkout's fence);
+      // the cart's current session can be swapped through the public payment-session
+      // route, so it is used only when nothing was recorded (codex security lens, PR 218).
+      const session = recordedProvider && recordedRef
+        ? { provider_id: recordedProvider, data: { ...(currentSession?.data ?? {}), stripe_session_id: recordedRef, mp_preference_id: recordedRef } }
+        : currentSession
       if (!session) {
         // Started but not yet linked: the QR is being created right now. Only a start
         // that clearly died (no session after CHECKOUT_OPEN_STALE_MS) may be closed.
@@ -243,6 +251,51 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
 class PaymentInFlight extends Error {}
 
 /**
+ * Expire one provider checkout by its id. Shared by cancel (the claim-recorded ref) and
+ * start-checkout (a checkout it created but may not keep). Throws PaymentInFlight when
+ * the buyer is already paying; any other failure throws — callers never assume success.
+ */
+export async function expireCounterCheckout(
+  providerId: string,
+  ref: string,
+  providerData: Record<string, unknown>,
+  mpToken: string | null,
+  cartId?: string,
+): Promise<void> {
+  if (providerId === 'pp_stripe-connect_stripe-connect') {
+    const ctx = readStripePaymentContext(providerData)
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-09-30.clover' as any })
+    const opts = ctx?.stripe_strategy === 'direct_charge' ? { stripeAccount: ctx.stripe_account_id } : undefined
+    const current = await stripe.checkout.sessions.retrieve(ref, {}, opts)
+    if (current.status === 'complete') throw new PaymentInFlight()
+    if (current.status === 'open') await stripe.checkout.sessions.expire(ref, {}, opts)
+    return
+  }
+  if (providerId === 'pp_mercadopago_mercadopago') {
+    if (!mpToken) throw new Error('seller MP token unavailable')
+    if (cartId) {
+      const search = await fetch(
+        `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(cartId)}`,
+        { headers: { Authorization: `Bearer ${mpToken}` } },
+      )
+      if (!search.ok) throw new Error(`MP payment search ${search.status}`)
+      const found = ((await search.json())?.results ?? []) as Array<{ status?: string }>
+      if (found.some((p) => ['approved', 'pending', 'in_process', 'authorized'].includes(String(p.status)))) {
+        throw new PaymentInFlight()
+      }
+    }
+    const res = await fetch(`https://api.mercadopago.com/checkout/preferences/${encodeURIComponent(ref)}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${mpToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expires: true, expiration_date_to: new Date().toISOString() }),
+    })
+    if (!res.ok) throw new Error(`MP preference expiry ${res.status}`)
+    return
+  }
+  // Manual (transfer) checkouts have nothing payable to expire.
+}
+
+/**
  * A checkout start that left no payment session after this long died (start-checkout
  * creates and links its session within one request; the proxy times out at 25 s).
  */
@@ -253,50 +306,21 @@ async function expireProviderCheckout(
   sellerId: string,
   session: { provider_id: string; data: Record<string, unknown>; cart_id?: string },
 ): Promise<void> {
-  if (session.provider_id === 'pp_stripe-connect_stripe-connect') {
-    const ctx = readStripePaymentContext(session.data)
-    const sessionId = ctx?.stripe_session_id ?? (session.data.stripe_session_id as string | undefined)
-    // No id ⇒ we cannot prove the QR is dead; refuse rather than call it cancelled (codex, PR 218).
-    if (!sessionId) throw new Error('stripe session id missing — cannot expire the checkout')
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-09-30.clover' as any })
-    // Direct charges (US) live on the seller's account; MX destination charges on ours.
-    const opts = ctx?.stripe_strategy === 'direct_charge' ? { stripeAccount: ctx.stripe_account_id } : undefined
-    // Request options are the THIRD argument (the second is params) — passing the
-    // connected account second silently targets the platform account (codex, PR 218).
-    const current = await stripe.checkout.sessions.retrieve(sessionId, {}, opts)
-    // `complete` = the buyer paid and the webhook has not landed yet: cancelling now
-    // would tell the merchant "cancelled" moments before the sale turns paid.
-    if (current.status === 'complete') throw new PaymentInFlight()
-    if (current.status === 'open') await stripe.checkout.sessions.expire(sessionId, {}, opts)
-    return
-  }
-  if (session.provider_id === 'pp_mercadopago_mercadopago') {
-    const prefId = session.data.mp_preference_id
-    if (typeof prefId !== 'string' || !prefId) throw new Error('MP preference id missing — cannot expire the checkout')
+  const isStripe = session.provider_id === 'pp_stripe-connect_stripe-connect'
+  const isMp = session.provider_id === 'pp_mercadopago_mercadopago'
+  if (!isStripe && !isMp) return // manual (transfer): nothing payable to expire
+  const ctx = isStripe ? readStripePaymentContext(session.data) : null
+  const ref = isStripe
+    ? (ctx?.stripe_session_id ?? (session.data.stripe_session_id as string | undefined))
+    : (session.data.mp_preference_id as string | undefined)
+  // No id ⇒ we cannot prove the QR is dead; refuse rather than call it cancelled (codex, PR 218).
+  if (typeof ref !== 'string' || !ref) throw new Error('provider checkout id missing — cannot expire it')
+  let token: string | null = null
+  if (isMp) {
     const sellerService = scope.resolve(SELLER_MODULE)
     const [seller] = await sellerService.listSellers({ id: sellerId })
-    const token = await resolveSellerMpToken(sellerService, seller)
-    if (!token) throw new Error('seller MP token unavailable')
+    token = await resolveSellerMpToken(sellerService, seller)
     if (!session.cart_id) throw new Error('cart id unavailable for the MP payment search')
-    // A payment already approved or in process for this cart means the money is (or may
-    // be) on its way — refuse to call that cancelled. external_reference is the cart id
-    // (start-checkout's preference payload).
-    const search = await fetch(
-      `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(session.cart_id ?? '')}`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    )
-    if (!search.ok) throw new Error(`MP payment search ${search.status}`)
-    const found = ((await search.json())?.results ?? []) as Array<{ status?: string }>
-    if (found.some((p) => p.status === 'approved' || p.status === 'pending' || p.status === 'in_process' || p.status === 'authorized')) {
-      throw new PaymentInFlight()
-    }
-    const res = await fetch(`https://api.mercadopago.com/checkout/preferences/${encodeURIComponent(prefId)}`, {
-      method: 'PUT',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expires: true, expiration_date_to: new Date().toISOString() }),
-    })
-    if (!res.ok) throw new Error(`MP preference expiry ${res.status}`)
-    return
   }
-  // Manual (transfer) sessions have nothing payable to expire.
+  await expireCounterCheckout(session.provider_id, ref, session.data, token, session.cart_id)
 }
