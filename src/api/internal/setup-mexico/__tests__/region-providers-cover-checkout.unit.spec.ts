@@ -16,8 +16,8 @@ const ROOT = join(__dirname, '..', '..', '..', '..', '..')
 const read = (rel: string) => readFileSync(join(ROOT, rel), 'utf8')
 
 function regionProviders(): Set<string> {
-  const src = read('src/api/internal/setup-mexico/route.ts')
-  const block = src.match(/const MX_PAYMENT_PROVIDERS = \[([\s\S]*?)\]/)
+  const src = read('src/lib/mx-payment-providers.ts')
+  const block = src.match(/export const MX_PAYMENT_PROVIDERS = \[([\s\S]*?)\]/)
   if (!block) throw new Error('MX_PAYMENT_PROVIDERS not found — the guard cannot see the list it guards')
   return new Set([...block[1].matchAll(/'(pp_[^']+)'/g)].map((m) => m[1]))
 }
