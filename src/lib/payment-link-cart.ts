@@ -11,7 +11,7 @@
  * custom price, not a variant-less custom line: the seller's inbox finds orders by
  * product ownership, so a line with no product would hide the paid order from its seller.
  */
-import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
+import { ContainerRegistrationKeys, Modules, QueryContext } from '@medusajs/framework/utils'
 import { createCartWorkflow } from '@medusajs/medusa/core-flows'
 import { IN_PERSON_MODULE } from '../modules/in-person'
 import { SELLER_MODULE } from '../modules/seller'
@@ -65,14 +65,16 @@ export async function publicPaymentLink(scope: Scope, token: string, now: Date =
     const query = scope.resolve(ContainerRegistrationKeys.QUERY)
     const { data } = await query.graph({
       entity: 'variant',
-      fields: ['id', 'title', 'product.title', 'prices.amount', 'prices.currency_code'],
+      // The SAME price the cart will charge: the variant's calculated price in the MX
+      // region — not "the first MXN price", which can differ (codex, PR 221 round 5).
+      fields: ['id', 'title', 'product.title', 'calculated_price.calculated_amount'],
       filters: { id: (link.lines ?? []).map((l: any) => l.variant_id) },
+      context: { calculated_price: QueryContext({ region_id: resolveRegionIdForMarket('mx', process.env), currency_code: 'mxn' }) },
     })
     const byId = new Map<string, any>((data ?? []).map((v: any) => [v.id, v]))
     lines = (link.lines ?? []).map((l: any) => {
       const v = byId.get(l.variant_id)
-      const price = (v?.prices ?? []).find((p: any) => String(p.currency_code).toLowerCase() === 'mxn')
-      return { title: v?.product?.title ?? v?.title ?? 'Producto', quantity: l.quantity, unit_price_cents: Math.round(Number(price?.amount ?? 0)) }
+      return { title: v?.product?.title ?? v?.title ?? 'Producto', quantity: l.quantity, unit_price_cents: Math.round(Number(v?.calculated_price?.calculated_amount ?? 0)) }
     })
   }
   const total = link.kind === 'amount'
@@ -341,6 +343,12 @@ export async function claimLinkCartCheckout(scope: Scope, cartId: string): Promi
         set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_started_at', now()::text),
             updated_at = now()
       where cart_id = ? and (metadata->>'checkout_started_at') is null
+        -- The link must still be open AT the claim, for every link (not only single-use,
+        -- whose hold already checks it): a cancel that lands while the provider checkout
+        -- is being created wins, and the caller expires it (codex, PR 221 round 5).
+        and exists (select 1 from payment_link pl
+                     where pl.id = payment_link_cart.payment_link_id
+                       and pl.status = 'pending' and pl.expires_at > now() and pl.deleted_at is null)
       returning id`,
     [cartId],
   )
