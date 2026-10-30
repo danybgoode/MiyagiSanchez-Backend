@@ -25,6 +25,7 @@ import { SELLER_MODULE } from '../modules/seller'
 import { resolveSellerProductIds } from '../api/store/_utils/seller-catalog-query'
 import { isHiddenCatalogProduct, isSupportProductMetadata } from '../api/store/_utils/support'
 import { captureOrderPayment } from './order-payment-capture'
+import { recordOversoldOfflineSale } from './in-person-sale-oversold'
 import { getInPersonSaleStatus, type InPersonSaleState } from './in-person-sale-status'
 import { resolveShippingOptionIds } from '../api/store/_utils/fulfillment'
 import { readSellerOperatingMarket } from './seller-market'
@@ -518,6 +519,32 @@ export async function recordInPersonSale(
     })
     return { ok: true, status: replayed ? 200 : 201, body: { order_id: orderId, total_cents: total, change_cents, replayed } }
   } catch (e) {
+    if (isStockError(e) && sale.offline && sale.kind === 'cash') {
+      // D12: an OFFLINE cash sale already happened — record it anyway, decrement what
+      // stock has, and flag the shortfall (in-person-sale-oversold.ts). Online sales keep
+      // the normal refusal below.
+      try {
+        const { orderId, totalCents, oversold } = await recordOversoldOfflineSale(scope, {
+          sellerId, sale, regionId, channelId,
+          email: PLACEHOLDER_BUYER_EMAIL,
+          soldAt: sale.sold_at ?? now.toISOString(),
+        })
+        const { change_cents } = cashChange(totalCents, sale.tendered_cents)
+        await inPerson.updateInPersonSales({
+          id: claimId,
+          status: 'completed',
+          order_id: orderId,
+          oversold: oversold.length > 0,
+          metadata: { tendered_cents: sale.tendered_cents, change_cents, total_cents: totalCents, oversold },
+        })
+        return { ok: true, status: 201, body: { order_id: orderId, total_cents: totalCents, change_cents, replayed: false } }
+      } catch (fallbackError) {
+        // Not a refusal: the sale happened. Keep the claim retryable (the queue resends).
+        await releaseClaim(scope, claimId, token).catch(() => {})
+        console.error('[in-person] offline oversell fallback failed', { claimId, message: (fallbackError as Error)?.message })
+        return refuse(503, 'RETRY_SAME_ID', 'No se pudo registrar la venta sin señal. Se reintentará.')
+      }
+    }
     if (isStockError(e)) {
       // A definitive refusal: this sale can never complete as rung up. Close the
       // claim so a resend of the same client_id is told so instead of retrying.

@@ -260,3 +260,31 @@ export function cartMutationTarget(method: string, path: string): CartMutationTa
   if (c[2] && OPEN_CART_ACTIONS.has(c[2])) return null
   return { cartId: c[1] }
 }
+
+export interface OversoldLinePlan {
+  variant_id: string
+  quantity: number
+  /** Units actually taken out of stock (never below zero available). */
+  decrement: number
+  /** Units sold that stock no longer had: the merchant sold more than the system knew. */
+  shortfall: number
+}
+
+/**
+ * D12 — an OFFLINE cash sale already happened at the stall, so at sync it is recorded
+ * even when stock ran out meanwhile (an online sale took the last unit). Stock is
+ * decremented only as far as it goes (`available` = stocked − reserved, never below
+ * zero) and the rest is recorded as a shortfall the inbox flags. `available` null means
+ * the variant does not manage inventory: nothing to decrement, nothing short.
+ */
+export function planOversoldDecrement(
+  lines: Array<{ variant_id: string; quantity: number }>,
+  available: Record<string, number | null>,
+): OversoldLinePlan[] {
+  return lines.map((l) => {
+    const a = available[l.variant_id]
+    if (a == null) return { variant_id: l.variant_id, quantity: l.quantity, decrement: 0, shortfall: 0 }
+    const decrement = Math.max(0, Math.min(l.quantity, Math.floor(a)))
+    return { variant_id: l.variant_id, quantity: l.quantity, decrement, shortfall: l.quantity - decrement }
+  })
+}

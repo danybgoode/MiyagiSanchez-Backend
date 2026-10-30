@@ -263,6 +263,31 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         expect(fixed.status).toBe(201)
       })
 
+      it('an OFFLINE cash sale past the stock is recorded anyway and flagged (D12), exactly once', async () => {
+        const container = getContainer()
+        const s = sale({ lines: [{ variant_id: variantId, quantity: 7 }], tendered_cents: null, offline: true, sold_at: new Date(Date.now() - 3600_000).toISOString() })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(`${r.code}: ${r.message}`)
+        expect(r.status).toBe(201)
+        expect(r.body.total_cents).toBe(7 * 15000)
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'order', fields: ['id', 'metadata'], filters: { id: r.body.order_id },
+        })
+        const meta = (data[0] as any).metadata
+        expect(meta.source).toBe('in_person')
+        expect(meta.payment_received).toBe(true)
+        expect(meta.in_person.offline).toBe(true)
+        expect(meta.oversold.lines).toEqual([{ variant_id: variantId, quantity: 7, decrement: 5, shortfall: 2 }])
+        // Stock went to zero, not below.
+        expect(await getProductAvailableQuantity(container as any, productId)).toBe(0)
+        // A resend from the device's queue returns the same order and takes nothing more.
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        if (!again.ok) throw new Error(again.code)
+        expect(again.body.order_id).toBe(r.body.order_id)
+        expect(again.body.replayed).toBe(true)
+        expect(await getProductAvailableQuantity(container as any, productId)).toBe(0)
+      })
+
       it('more than the stock on hand is refused online (OUT_OF_STOCK) and the claim is closed', async () => {
         const container = getContainer()
         const s = sale({ lines: [{ variant_id: variantId, quantity: 6 }], tendered_cents: null })
