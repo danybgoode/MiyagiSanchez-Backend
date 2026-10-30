@@ -145,6 +145,10 @@ export async function buildPaymentLinkCart(scope: Scope, token: string, now: Dat
   if (!link) return { ok: false, status: 404, code: 'LINK_NOT_FOUND', message: 'Este link no existe.' }
   const closed = closedRefusal(derivePaymentLinkState(link, now))
   if (closed) return closed
+  if (link.uses === 'single') {
+    const healed = await healSingleUseLink(scope, link.id)
+    if (healed) return healed
+  }
 
   const [seller] = await scope.resolve(SELLER_MODULE).listSellers({ id: link.seller_id })
   const gate = sellerRowEnforcement(seller)
@@ -227,13 +231,14 @@ export async function holdSingleUseLink(scope: Scope, linkId: string, cartId: st
  * Record an order on the payment link it was paid through, if any (D13: "the order's
  * payment drives `paid`").
  *
- * Called on `order.placed` and again when the seller confirms a «Pago directo» order.
- * The order's id is always appended (idempotently) so the seller sees it. A SINGLE-use
- * link is closed only once the money is real: a processor-confirmed card payment, or a
- * manual payment the seller confirmed. A manual order that is merely pending must not
- * close the link — anyone holding the token could otherwise close it for free (verifier,
- * PR 221). The status write is conditional on `pending`, so a seller's cancel is never
- * overwritten.
+ * Called on `order.placed`, when the seller confirms a «Pago directo» order, and by
+ * `healSingleUseLink` before any new checkout opens (so a missed or failed event can
+ * never leave a paid single-use link open — codex, PR 221 round 4).
+ *  · Real money (a processor-confirmed card payment, or a manual payment the seller
+ *    confirmed) goes to `paid_order_ids` and closes a SINGLE-use link.
+ *  · A pending «Pago directo» order goes to `metadata.pending_order_ids` only — it is
+ *    not payment evidence, and must not look like it (round 4).
+ * Idempotent; the status write is conditional on `pending`, so a cancel is never overwritten.
  */
 export async function recordLinkOrder(scope: Scope, orderId: string): Promise<void> {
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
@@ -242,28 +247,90 @@ export async function recordLinkOrder(scope: Scope, orderId: string): Promise<vo
   if (!cartId) return
   const [lc] = await scope.resolve(IN_PERSON_MODULE).listPaymentLinkCarts({ cart_id: cartId }, { take: 1 })
   if (!lc) return
-  const { data } = await query.graph({
+  const fact = await orderMoneyFact(scope, orderId)
+  const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  if (fact === 'real') {
+    await knex.raw(
+      `update payment_link
+          set paid_order_ids = case
+                when coalesce(paid_order_ids, '[]'::jsonb) @> to_jsonb(?::text) then paid_order_ids
+                else coalesce(paid_order_ids, '[]'::jsonb) || to_jsonb(?::text)
+              end,
+              metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{pending_order_ids}',
+                coalesce(metadata->'pending_order_ids', '[]'::jsonb) - ?::text),
+              status = case when uses = 'single' and status = 'pending' then 'paid' else status end,
+              updated_at = now()
+        where id = ?`,
+      [orderId, orderId, orderId, lc.payment_link_id],
+    )
+  } else if (fact === 'pending') {
+    await knex.raw(
+      `update payment_link
+          set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{pending_order_ids}',
+                case when coalesce(metadata->'pending_order_ids', '[]'::jsonb) @> to_jsonb(?::text)
+                     then metadata->'pending_order_ids'
+                     else coalesce(metadata->'pending_order_ids', '[]'::jsonb) || to_jsonb(?::text) end),
+              updated_at = now()
+        where id = ?`,
+      [orderId, orderId, lc.payment_link_id],
+    )
+  } else {
+    // A canceled order is neither payment nor pending: drop it from the pending list so the
+    // link reopens (the seller cancelled an unpaid transfer in Pedidos).
+    await knex.raw(
+      `update payment_link
+          set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{pending_order_ids}',
+                coalesce(metadata->'pending_order_ids', '[]'::jsonb) - ?::text),
+              updated_at = now()
+        where id = ?`,
+      [orderId, lc.payment_link_id],
+    )
+  }
+}
+
+/** What an order is worth to its link: real money, a pending transfer, or nothing (canceled). */
+async function orderMoneyFact(scope: Scope, orderId: string): Promise<'real' | 'pending' | 'none'> {
+  const { data } = await scope.resolve(ContainerRegistrationKeys.QUERY).graph({
     entity: 'order',
-    fields: ['id', 'metadata', 'payment_collections.payments.provider_id', 'payment_collections.payments.captured_at'],
+    fields: ['id', 'status', 'metadata', 'payment_collections.payments.provider_id', 'payment_collections.payments.captured_at'],
     filters: { id: orderId },
   })
   const order = data?.[0] as any
-  const payment = (order?.payment_collections ?? []).flatMap((pc: any) => pc?.payments ?? [])[0]
+  if (!order || order.status === 'canceled') return 'none'
+  const payment = (order.payment_collections ?? []).flatMap((pc: any) => pc?.payments ?? [])[0]
   const provider = String(payment?.provider_id ?? '')
-  const moneyIsReal = provider === 'pp_stripe-connect_stripe-connect' || provider === 'pp_mercadopago_mercadopago'
-    || Boolean(payment?.captured_at) || order?.metadata?.payment_received === true
-  const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
-  await knex.raw(
-    `update payment_link
-        set paid_order_ids = case
-              when coalesce(paid_order_ids, '[]'::jsonb) @> to_jsonb(?::text) then paid_order_ids
-              else coalesce(paid_order_ids, '[]'::jsonb) || to_jsonb(?::text)
-            end,
-            status = case when ? and uses = 'single' and status = 'pending' then 'paid' else status end,
-            updated_at = now()
-      where id = ?`,
-    [orderId, orderId, moneyIsReal, lc.payment_link_id],
-  )
+  const real = provider === 'pp_stripe-connect_stripe-connect' || provider === 'pp_mercadopago_mercadopago'
+    || Boolean(payment?.captured_at) || order.metadata?.payment_received === true
+  return real ? 'real' : 'pending'
+}
+
+/**
+ * Before a SINGLE-use link opens a new checkout (or a new cart): re-derive what every
+ * order placed through it is worth and record it. Returns why the link cannot take a new
+ * payment, or null. Never trusts the `order.placed` event to have run (round 4).
+ */
+export async function healSingleUseLink(scope: Scope, linkId: string): Promise<Refusal | null> {
+  const carts = await scope.resolve(IN_PERSON_MODULE).listPaymentLinkCarts({ payment_link_id: linkId }, { take: 500 })
+  const cartIds = (carts ?? []).map((c: any) => c.cart_id)
+  if (!cartIds.length) return null
+  const { data: oc } = await scope.resolve(ContainerRegistrationKeys.QUERY).graph({
+    entity: 'order_cart', fields: ['order_id', 'cart_id'], filters: { cart_id: cartIds },
+  })
+  let pending = false
+  for (const row of (oc ?? []) as any[]) {
+    if (!row?.order_id) continue
+    await recordLinkOrder(scope, row.order_id)
+    if ((await orderMoneyFact(scope, row.order_id)) === 'pending') pending = true
+  }
+  const [link] = await scope.resolve(IN_PERSON_MODULE).listPaymentLinks({ id: linkId }, { take: 1 })
+  if (link?.status === 'paid') return closedRefusal('paid')
+  if (pending) {
+    // A transfer is waiting for the seller's «Ya me llegó». A second buyer must not be
+    // able to pay the same single-use link meanwhile (codex security lens, round 4); the
+    // seller confirms it, or cancels that order in Pedidos to reopen the link.
+    return { ok: false, status: 409, code: 'LINK_AWAITING_CONFIRMATION', message: 'Este cobro está esperando que la tienda confirme un pago.' }
+  }
+  return null
 }
 
 /** Take a link cart's one-and-only checkout. True only for the first caller. */

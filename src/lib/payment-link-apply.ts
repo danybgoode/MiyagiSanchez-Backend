@@ -31,7 +31,10 @@ export interface PaymentLinkView {
   uses: string
   expires_at: string
   state: PaymentLinkState
+  /** Orders paid with real money (processor-confirmed card, or a transfer the seller confirmed). */
   paid_order_ids: string[]
+  /** «Pago directo» orders waiting for the seller's «Ya me llegó» — NOT payment evidence. */
+  pending_order_ids: string[]
   created_at: string
 }
 
@@ -49,6 +52,7 @@ export function toView(row: any, now: Date = new Date()): PaymentLinkView {
     expires_at: new Date(row.expires_at).toISOString(),
     state: derivePaymentLinkState(row, now),
     paid_order_ids: Array.isArray(row.paid_order_ids) ? row.paid_order_ids : [],
+    pending_order_ids: Array.isArray(row.metadata?.pending_order_ids) ? row.metadata.pending_order_ids : [],
     created_at: new Date(row.created_at ?? now).toISOString(),
   }
 }
@@ -112,11 +116,17 @@ export async function cancelPaymentLink(scope: Scope, sellerId: string, linkId: 
   if (state === 'cancelled') return { ok: true, status: 200, body: toView(row, now) }
   if (state === 'paid') return { ok: false, status: 409, code: 'LINK_PAID', message: 'Este cobro ya se pagó.' }
   const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
-  await knex.raw(
+  const r = await knex.raw(
     `update payment_link set status = 'cancelled', updated_at = now()
-      where id = ? and seller_id = ? and status = 'pending'`,
+      where id = ? and seller_id = ? and status = 'pending'
+      returning id`,
     [linkId, sellerId],
   )
   const [after] = await svc.listPaymentLinks({ id: linkId, seller_id: sellerId }, { take: 1 })
+  // The write is conditional; if it changed nothing, a payment closed the link between our
+  // read and our write — report that, never "cancelled" (codex, PR 221 round 4).
+  if (!(r?.rows?.length) && derivePaymentLinkState(after, now) === 'paid') {
+    return { ok: false, status: 409, code: 'LINK_PAID', message: 'Este cobro ya se pagó.' }
+  }
   return { ok: true, status: 200, body: toView(after, now) }
 }

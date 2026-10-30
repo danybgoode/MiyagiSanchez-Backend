@@ -21,7 +21,7 @@ import { SELLER_MODULE } from '../../../../../modules/seller'
 import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
 import { CHECKOUT_OPEN_STALE_MS, expireCounterCheckout } from '../../../../../lib/in-person-sale-status'
 import { counterCartMatchesClaim } from '../../../../../lib/in-person-sale'
-import { LINK_HASH_KIND, claimLinkCartCheckout, closedRefusal, holdSingleUseLink, linkCartFor } from '../../../../../lib/payment-link-cart'
+import { LINK_HASH_KIND, claimLinkCartCheckout, closedRefusal, healSingleUseLink, holdSingleUseLink, linkCartFor } from '../../../../../lib/payment-link-cart'
 import { derivePaymentLinkState } from '../../../../../lib/payment-link'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
@@ -526,6 +526,10 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // at once would both be charged (codex, both lenses, PR 221). The hold is atomic and
     // lasts the checkout's own lifetime (COUNTER_CHECKOUT_TTL_MS, which link checkouts
     // also get below), so an abandoned attempt frees the link by itself.
+    if (lk.uses === 'single') {
+      const healed = await healSingleUseLink(req.scope, lk.id)
+      if (healed) return res.status(healed.status).json({ code: healed.code, message: healed.message })
+    }
     linkUses = lk.uses
     linkIdForHold = lk.id
     body.fulfillment_method = lk?.kind === 'amount' ? 'digital' : 'local_pickup'

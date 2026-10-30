@@ -530,13 +530,18 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         await recordLinkOrder(container as any, orderId)
         let row = await linkRow(container, made.body.id)
         expect(row.status).toBe('pending')
-        expect(row.paid_order_ids).toEqual([orderId])
+        // Not payment evidence: listed as pending, never as paid (codex, PR 221 round 4).
+        expect(row.paid_order_ids ?? []).toEqual([])
+        expect(row.metadata.pending_order_ids).toEqual([orderId])
+        // …and a second buyer cannot pay the same single-use link meanwhile.
+        expect(await buildPaymentLinkCart(container as any, made.body.token)).toMatchObject({ ok: false, code: 'LINK_AWAITING_CONFIRMATION' })
         // The seller confirms («Ya me llegó») → now the single-use link is paid and closed.
         await container.resolve(Modules.ORDER).updateOrders(orderId, { metadata: { payment_received: true } })
         await recordLinkOrder(container as any, orderId)
         row = await linkRow(container, made.body.id)
         expect(row.status).toBe('paid')
         expect(row.paid_order_ids).toEqual([orderId])
+        expect(row.metadata.pending_order_ids).toEqual([])
         const again = await buildPaymentLinkCart(container as any, made.body.token)
         expect(!again.ok && again.code).toBe('LINK_PAID')
       })
