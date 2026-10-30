@@ -20,6 +20,7 @@ import {
   stripeRefundParams,
   stripeRequestOptions,
 } from '../../lib/stripe-market-strategy'
+import { decideStripeAuthorization } from '../../lib/stripe-authorization'
 import {
   InitiatePaymentInput,
   InitiatePaymentOutput,
@@ -99,11 +100,10 @@ export class StripeConnectProviderService extends AbstractPaymentProvider<Option
   async authorizePayment(input: AuthorizePaymentInput): Promise<AuthorizePaymentOutput> {
     const data = (input.data ?? {}) as Record<string, unknown>
 
-    // If already marked as paid (by webhook flow), authorize immediately
-    if (data.status === 'paid') {
-      return { status: 'authorized' as PaymentSessionStatus, data }
-    }
-
+    // NEVER short-circuit on `data.status`: session data is written by whoever creates
+    // the payment session, including callers of Medusa's public payment-sessions route.
+    // Stripe's own answer decides, for a Checkout Session bound to THIS payment session
+    // (src/lib/stripe-authorization.ts has the hole this closed).
     const sessionId = data.stripe_session_id as string
     if (!sessionId) {
       return { status: 'pending' as PaymentSessionStatus, data }
@@ -111,13 +111,13 @@ export class StripeConnectProviderService extends AbstractPaymentProvider<Option
 
     try {
       const { options } = requestContextFor(data)
-      const session = await this.stripe_.checkout.sessions.retrieve(sessionId, options)
-      if (session.payment_status === 'paid') {
+      const session = await this.stripe_.checkout.sessions.retrieve(sessionId, {}, options)
+      const decision = decideStripeAuthorization(session as any, (input.context as any)?.idempotency_key)
+      if (decision === 'authorized') {
         return { status: 'authorized' as PaymentSessionStatus, data: { ...data, status: 'paid', stripe_payment_intent: session.payment_intent } }
       }
-      if (session.status === 'expired') {
-        return { status: 'canceled' as PaymentSessionStatus, data }
-      }
+      if (decision === 'canceled') return { status: 'canceled' as PaymentSessionStatus, data }
+      if (decision === 'refused') return { status: 'error' as PaymentSessionStatus, data }
       return { status: 'pending' as PaymentSessionStatus, data }
     } catch {
       return { status: 'error' as PaymentSessionStatus, data }
@@ -171,13 +171,14 @@ export class StripeConnectProviderService extends AbstractPaymentProvider<Option
   // ── getPaymentStatus ──────────────────────────────────────────────────────
   async getPaymentStatus(input: GetPaymentStatusInput): Promise<GetPaymentStatusOutput> {
     const data = (input.data ?? {}) as Record<string, unknown>
-    if (data.status === 'paid') return { status: 'captured' as PaymentSessionStatus }
-
+    // Same rule as authorizePayment: Stripe decides, never stored `data.status`.
     const sessionId = data.stripe_session_id as string
     if (!sessionId) return { status: 'pending' as PaymentSessionStatus }
 
     try {
-      const session = await this.stripe_.checkout.sessions.retrieve(sessionId, requestContextFor(data).options)
+      const session = await this.stripe_.checkout.sessions.retrieve(sessionId, {}, requestContextFor(data).options)
+      const decision = decideStripeAuthorization(session as any, (input.context as any)?.idempotency_key)
+      if (decision === 'refused') return { status: 'error' as PaymentSessionStatus }
       if (session.payment_status === 'paid') return { status: 'captured' as PaymentSessionStatus }
       if (session.status === 'expired') return { status: 'canceled' as PaymentSessionStatus }
       return { status: 'pending' as PaymentSessionStatus }
