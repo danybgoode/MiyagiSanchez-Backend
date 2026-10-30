@@ -121,11 +121,16 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         otherVariantId = other.variants[0].id
       })
 
+      // RAW available (stocked − reserved), never clamped — getProductAvailableQuantity
+      // floors at 0 and would hide a negative level (verifier, PR 220).
       async function stockedOf(container: any, vId: string): Promise<number> {
         const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
-          entity: 'variant', fields: ['inventory_items.inventory.location_levels.stocked_quantity'], filters: { id: vId },
+          entity: 'variant',
+          fields: ['inventory_items.inventory.location_levels.stocked_quantity', 'inventory_items.inventory.location_levels.reserved_quantity'],
+          filters: { id: vId },
         })
-        return Number((data[0] as any).inventory_items[0].inventory.location_levels[0].stocked_quantity)
+        const lvl = (data[0] as any).inventory_items[0].inventory.location_levels[0]
+        return Number(lvl.stocked_quantity) - Number(lvl.reserved_quantity)
       }
 
       const sale = (over: Record<string, unknown> = {}) => {

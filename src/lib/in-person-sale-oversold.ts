@@ -196,27 +196,35 @@ async function takeStockOnce(
       const [level] = await inventory.listInventoryLevels({ inventory_item_id: itemId, location_id: locationId })
       available[l.variant_id] = Number(level?.stocked_quantity ?? 0) - Number(level?.reserved_quantity ?? 0)
     }
-    // The plan is fixed on the FIRST attempt and stored, with each line marked applied
-    // right after its own adjustment: a retry after a partial failure resumes from the
-    // stored plan and skips applied lines instead of decrementing them again (codex,
-    // PR 220 round 2). Residual window: a crash between one line's adjustInventory and its
-    // marker write — one line, at most once.
-    const plan: Array<ReturnType<typeof planOversoldDecrement>[number] & { applied?: boolean }> =
+    // The plan is fixed on the FIRST attempt and stored. Stock is held with an inventory
+    // RESERVATION per order line item — exactly how an online order holds its stock — and
+    // a reservation that already exists for that line item is never created again. That
+    // makes the stock step idempotent by itself: a crash anywhere, then a retry, finds the
+    // reservation and skips (codex, PR 220 round 3 — a per-line "applied" flag written
+    // AFTER adjustInventory still had a crash window that decremented twice).
+    const plan: ReturnType<typeof planOversoldDecrement> =
       Array.isArray(meta.oversold_plan) ? meta.oversold_plan : planOversoldDecrement(lines, available)
-    let current = { ...meta, oversold_plan: plan }
+    const current = { ...meta, oversold_plan: plan }
     if (!Array.isArray(meta.oversold_plan)) await orderService.updateOrders(orderId, { metadata: current })
-    for (let i = 0; i < plan.length; i++) {
-      const p = plan[i]
+    const { data: orderRows } = await query.graph({ entity: 'order', fields: ['id', 'items.id', 'items.variant_id'], filters: { id: orderId } })
+    const lineOf = new Map<string, string>(
+      (((orderRows?.[0] as any)?.items ?? []) as Array<{ id: string; variant_id: string }>).map((i) => [i.variant_id, i.id]),
+    )
+    for (const p of plan) {
       const itemId = itemOf[p.variant_id]
-      if (p.applied || !itemId || !locationId || p.decrement <= 0) continue
-      await inventory.adjustInventory(itemId, locationId, -p.decrement)
-      plan[i] = { ...p, applied: true }
-      current = { ...current, oversold_plan: plan }
-      await orderService.updateOrders(orderId, { metadata: current })
+      const lineItemId = lineOf.get(p.variant_id)
+      if (!itemId || !locationId || !lineItemId || p.decrement <= 0) continue
+      const [held] = await inventory.listReservationItems({ line_item_id: lineItemId }, { take: 1 })
+      if (held) continue
+      await inventory.createReservationItems([{
+        inventory_item_id: itemId,
+        location_id: locationId,
+        quantity: p.decrement,
+        line_item_id: lineItemId,
+        description: 'Venta en persona sin señal (registrada al sincronizar)',
+      }])
     }
-    const shortfall = plan
-      .filter((p) => p.shortfall > 0)
-      .map(({ variant_id, quantity, decrement, shortfall: short }) => ({ variant_id, quantity, decrement, shortfall: short }))
+    const shortfall = plan.filter((p) => p.shortfall > 0)
     await orderService.updateOrders(orderId, {
       metadata: { ...current, oversold: shortfall.length ? { lines: shortfall } : null, oversold_stock_done: true },
     })
