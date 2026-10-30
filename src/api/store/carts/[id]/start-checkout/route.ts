@@ -18,6 +18,7 @@ import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
 import { Modules, ContainerRegistrationKeys } from '@medusajs/framework/utils'
 import { ICartModuleService, IPaymentModuleService, IPromotionModuleService } from '@medusajs/framework/types'
 import { SELLER_MODULE } from '../../../../../modules/seller'
+import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
@@ -215,6 +216,17 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
   return rows ?? []
 }
 
+/**
+ * Is `cartId` a cart our server built for this source? Read from the server's own
+ * record, never the cart's client-writable metadata (D8).
+ */
+async function serverBuiltCart(req: MedusaRequest, cartId: string, source: 'in_person' | 'payment_link'): Promise<boolean> {
+  if (source !== 'in_person') return false // payment links register their carts in S4
+  const inPerson: any = req.scope.resolve(IN_PERSON_MODULE)
+  const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
+  return Boolean(claim)
+}
+
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const { id: cartId } = req.params
   const body = req.body as {
@@ -351,9 +363,15 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // server routes built and priced. The source is read from the CART's metadata —
   // never the body — because only those routes write it. For such a cart the cart
   // total IS the price: no client offer amount, coupon or bundle can move it.
+  //
+  // The metadata alone is NOT proof: Medusa's public store routes (POST /store/carts,
+  // POST /store/carts/:id) accept client `metadata`, so a buyer could label any cart
+  // `in_person`. The source counts only when the server's own record names THIS cart
+  // — an `in_person_sale` claim for a counter cart (payment links: S4).
   const cartMeta = ((cart as any).metadata ?? {}) as Record<string, unknown>
+  const claimedSource = cartMeta.source === 'in_person' || cartMeta.source === 'payment_link' ? cartMeta.source : null
   const serverCartSource: 'in_person' | 'payment_link' | null =
-    cartMeta.source === 'in_person' || cartMeta.source === 'payment_link' ? cartMeta.source : null
+    claimedSource && (await serverBuiltCart(req, cartId, claimedSource)) ? claimedSource : null
   const isCounterCart = serverCartSource === 'in_person'
   const paymentLinkId = serverCartSource === 'payment_link' && typeof cartMeta.payment_link_id === 'string'
     ? cartMeta.payment_link_id
