@@ -224,14 +224,14 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
  * Is `cartId` a cart our server built for this source? Read from the server's own
  * record, never the cart's client-writable metadata (D8).
  */
-type CounterClaim = { status: string; kind: string; payload_hash: string; metadata: Record<string, unknown> | null }
+type CounterClaim = { status: string; kind: string; payload_hash: string; seller_id: string; metadata: Record<string, unknown> | null }
 
 async function serverBuiltCart(req: MedusaRequest, cartId: string): Promise<CounterClaim | null> {
   // payment links register their carts in S4
   const inPerson: any = req.scope.resolve(IN_PERSON_MODULE)
   const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
   return claim
-    ? { status: String(claim.status), kind: String(claim.kind), payload_hash: String(claim.payload_hash), metadata: claim.metadata ?? null }
+    ? { status: String(claim.status), kind: String(claim.kind), payload_hash: String(claim.payload_hash), seller_id: String(claim.seller_id), metadata: claim.metadata ?? null }
     : null
 }
 
@@ -310,6 +310,18 @@ async function releaseCounterCheckout(req: MedusaRequest, cartId: string, mark: 
         and (metadata->>'checkout_ref') is null`,
     [cartId, mark],
   )
+}
+
+/** Unlink every payment collection from a counter cart (debris of a dead attempt). */
+async function unlinkCartCollection(req: MedusaRequest, cartId: string): Promise<void> {
+  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'cart', fields: ['id', 'payment_collection.id'], filters: { id: cartId } })
+  const pcId = (data?.[0] as any)?.payment_collection?.id
+  if (!pcId) return
+  await req.scope.resolve(ContainerRegistrationKeys.LINK).dismiss({
+    [Modules.CART]: { cart_id: cartId },
+    [Modules.PAYMENT]: { payment_collection_id: pcId },
+  })
 }
 
 /** Does this cart already carry a payment collection (i.e. a checkout was opened)? */
@@ -494,7 +506,17 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       return res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
     }
     if (await cartHasPaymentCollection(req, cartId)) {
-      return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+      // A collection with a RECORDED checkout is the live one. One with no recorded
+      // checkout is debris from an attempt that died between linking it and fencing it
+      // (a crash); once that attempt is stale it is unlinked so the sale can be retried
+      // (codex, PR 218).
+      const meta = (serverClaim!.metadata ?? {}) as Record<string, unknown>
+      const started = typeof meta.checkout_started_at === 'string' ? meta.checkout_started_at : null
+      const stale = !started || Date.now() - new Date(started).getTime() >= CHECKOUT_OPEN_STALE_MS
+      if (meta.checkout_ref || !stale) {
+        return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+      }
+      await unlinkCartCollection(req, cartId)
     }
     // The cart must still be EXACTLY what the merchant rang up: anyone holding a cart id
     // can edit its lines or add a promotion through Medusa's public cart routes, and the
@@ -514,6 +536,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     body.escrow = false
     body.pickup_spot_id = undefined
     body.pickup_appointment = undefined
+    // The seller who receives the money is the sale's seller — never a caller-supplied id,
+    // which seller resolution would otherwise prefer (codex security lens, PR 218).
+    body.seller_id = serverClaim!.seller_id
     //
     // The ONE-checkout guarantee is taken later, AFTER the provider checkout exists
     // (`openCounterCheckout` + `fenceCounterCheckout` below): marking here let any
