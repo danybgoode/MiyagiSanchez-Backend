@@ -25,12 +25,14 @@ import { SELLER_MODULE } from '../modules/seller'
 import { resolveSellerProductIds } from '../api/store/_utils/seller-catalog-query'
 import { isHiddenCatalogProduct, isSupportProductMetadata } from '../api/store/_utils/support'
 import { captureOrderPayment } from './order-payment-capture'
+import { OversoldOwnershipLost, recordOversoldOfflineSale } from './in-person-sale-oversold'
 import { getInPersonSaleStatus, type InPersonSaleState } from './in-person-sale-status'
 import { resolveShippingOptionIds } from '../api/store/_utils/fulfillment'
 import { readSellerOperatingMarket } from './seller-market'
 import { sellerRowEnforcement } from './seller-status'
 import { resolveOperatingChannelId, resolveRegionIdForMarket } from './market-medusa'
 import {
+  CLAIM_STALE_MS,
   cashChange,
   decideExistingClaim,
   inPersonPayloadHash,
@@ -277,15 +279,21 @@ async function takeOverClaim(
   seenToken: string,
   newToken: string,
   now: Date,
-): Promise<{ cart_id: string | null } | null> {
+): Promise<{ cart_id: string | null; metadata: Record<string, unknown> | null } | null> {
+  // Staleness is re-checked IN the write, not only on the snapshot we read: the current
+  // owner renews `claimed_at` while it works (the D12 fence), and a takeover decided on an
+  // older read must lose to that renewal. The row returned is the row as taken over — its
+  // metadata, not the earlier snapshot's, decides whether to resume the D12 fallback
+  // (codex security lens, PR 220 round 4).
   const res = await knexOf(scope).raw(
     `update in_person_sale set claim_token = ?, claimed_at = ?, updated_at = now()
       where id = ? and claim_token = ? and status = 'claimed' and deleted_at is null
-      returning cart_id`,
-    [newToken, now, claimId, seenToken],
+        and claimed_at <= ?
+      returning cart_id, metadata`,
+    [newToken, now, claimId, seenToken, new Date(now.getTime() - CLAIM_STALE_MS)],
   )
   const row = res?.rows?.[0]
-  return row ? { cart_id: row.cart_id ?? null } : null
+  return row ? { cart_id: row.cart_id ?? null, metadata: row.metadata ?? null } : null
 }
 
 /** Record the cart this owner built. Fails if ownership moved, or a cart is already recorded. */
@@ -368,6 +376,7 @@ export async function recordInPersonSale(
   const token = randomUUID()
   let claimId: string
   let existingCartId: string | null = null
+  let resumeOversold = false
   const insertedId = await insertClaim(scope, {
     seller_id: sellerId,
     client_id: sale.client_id,
@@ -416,12 +425,53 @@ export async function recordInPersonSale(
         if (!won) return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
         claimId = existing.id
         existingCartId = won.cart_id
+        // A previous attempt reached the D12 fallback: its order may already exist
+        // OUTSIDE any cart. Resume THAT path (it adopts the order and finishes stock and
+        // ledger) — the cart path cannot see it, and with stock back it would complete a
+        // second order (verifier, PR 220).
+        resumeOversold = Boolean((won.metadata as any)?.oversold_fallback_at)
         break
       }
     }
   }
 
+  // D12 fallback, shared by a stock refusal and by a takeover that resumes it.
+  const runOversoldFallback = async (): Promise<RecordResult> => {
+    try {
+      const { orderId, totalCents, oversold, adopted } = await recordOversoldOfflineSale(scope, {
+        sellerId, sale, regionId, channelId,
+        email: PLACEHOLDER_BUYER_EMAIL,
+        soldAt: sale.sold_at ?? now.toISOString(),
+        claimId, claimToken: token,
+      })
+      const { change_cents, short_cents } = cashChange(totalCents, sale.tendered_cents)
+      // Token-conditional: only the current owner settles the claim.
+      await knexOf(scope).raw(
+        `update in_person_sale
+            set status = 'completed', order_id = ?, oversold = ?, updated_at = now(),
+                metadata = coalesce(metadata, '{}'::jsonb) || ?::jsonb
+          where id = ? and claim_token = ?`,
+        [orderId, oversold.length > 0, JSON.stringify({
+          tendered_cents: sale.tendered_cents, change_cents, total_cents: totalCents, oversold,
+          // The sale happened, so it is recorded even if the cash noted was short — but
+          // the merchant sees it (verifier, PR 220).
+          ...(short_cents > 0 ? { short_cents } : {}),
+        }), claimId, token],
+      )
+      return { ok: true, status: adopted ? 200 : 201, body: { order_id: orderId, total_cents: totalCents, change_cents, replayed: adopted } }
+    } catch (fallbackError) {
+      if (fallbackError instanceof OversoldOwnershipLost) {
+        return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
+      }
+      // Not a refusal: the sale happened. Keep the claim retryable (the queue resends).
+      await releaseClaim(scope, claimId, token).catch(() => {})
+      console.error('[in-person] offline oversell fallback failed', { claimId, message: (fallbackError as Error)?.message })
+      return refuse(503, 'RETRY_SAME_ID', 'No se pudo registrar la venta sin señal. Se reintentará.')
+    }
+  }
+
   // ── apply ────────────────────────────────────────────────────────────────────
+  if (resumeOversold) return runOversoldFallback()
   try {
     let cartId = existingCartId
     if (!cartId) {
@@ -518,6 +568,12 @@ export async function recordInPersonSale(
     })
     return { ok: true, status: replayed ? 200 : 201, body: { order_id: orderId, total_cents: total, change_cents, replayed } }
   } catch (e) {
+    if (isStockError(e) && sale.offline && sale.kind === 'cash') {
+      // D12: an OFFLINE cash sale already happened — record it anyway, decrement what
+      // stock has, and flag the shortfall (in-person-sale-oversold.ts). Online sales keep
+      // the normal refusal below.
+      return runOversoldFallback()
+    }
     if (isStockError(e)) {
       // A definitive refusal: this sale can never complete as rung up. Close the
       // claim so a resend of the same client_id is told so instead of retrying.

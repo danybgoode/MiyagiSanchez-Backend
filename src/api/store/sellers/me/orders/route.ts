@@ -337,6 +337,11 @@ export function normalizeMedusaOrder(
     tags,
     ml_order_id: source === 'mercadolibre' ? ((metadata.ml_order_id as string) ?? null) : null,
     ml_pack_id: source === 'mercadolibre' ? ((metadata.ml_pack_id as string) ?? null) : null,
+    // in-person-sales D12: an offline counter sale recorded past its stock. The inbox
+    // flags it «Vendiste más de lo que tenías en inventario» with the short lines.
+    in_person_oversold: source === 'in_person' && metadata.oversold && typeof metadata.oversold === 'object'
+      ? ((metadata.oversold as { lines?: unknown }).lines ?? null)
+      : null,
     amount_cents: isSupportOrder ? (support.amount_cents ?? order.total ?? 0) : (order.total ?? 0),
     currency: ((order.currency_code as string) ?? 'mxn').toUpperCase(),
     shipping_method: isSupportOrder ? 'support' : selectedFulfillment,

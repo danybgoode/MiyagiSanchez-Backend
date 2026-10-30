@@ -230,3 +230,36 @@ describe('cartMutationTarget (counter carts are server-owned)', () => {
     expect(cartMutationTarget(m, p)).toBeNull()
   })
 })
+
+describe('planOversoldDecrement (D12, offline oversell)', () => {
+  const { planOversoldDecrement } = require('../in-person-sale')
+  it('takes what stock has and records the rest as a shortfall', () => {
+    expect(planOversoldDecrement([{ variant_id: 'a', quantity: 3 }], { a: 1 }))
+      .toEqual([{ variant_id: 'a', quantity: 3, decrement: 1, shortfall: 2 }])
+  })
+  it('enough stock: a plain decrement, no shortfall', () => {
+    expect(planOversoldDecrement([{ variant_id: 'a', quantity: 2 }], { a: 5 }))
+      .toEqual([{ variant_id: 'a', quantity: 2, decrement: 2, shortfall: 0 }])
+  })
+  it('stock already at or below zero: nothing to take, all short', () => {
+    expect(planOversoldDecrement([{ variant_id: 'a', quantity: 1 }], { a: 0 })[0]).toMatchObject({ decrement: 0, shortfall: 1 })
+    expect(planOversoldDecrement([{ variant_id: 'a', quantity: 1 }], { a: -2 })[0]).toMatchObject({ decrement: 0, shortfall: 1 })
+  })
+  it('an unmanaged variant has nothing to decrement and nothing short', () => {
+    expect(planOversoldDecrement([{ variant_id: 'a', quantity: 4 }], { a: null })[0]).toMatchObject({ decrement: 0, shortfall: 0 })
+  })
+})
+
+describe('sold_at bounds (verifier, PR 460)', () => {
+  const { validateInPersonSale } = require('../in-person-sale')
+  const now = new Date('2026-10-30T12:00:00Z')
+  const b = (sold_at: string) => ({ client_id: '6f1c2b8e-4d3a-4b7e-9c1d-2a3b4c5d6e7f', kind: 'cash', lines: [{ variant_id: 'v', quantity: 1 }], offline: true, sold_at })
+  it('accepts a sale from yesterday and a phone clock a minute ahead', () => {
+    expect(validateInPersonSale(b('2026-10-29T12:00:00Z'), now).ok).toBe(true)
+    expect(validateInPersonSale(b('2026-10-30T12:01:00Z'), now).ok).toBe(true)
+  })
+  it('refuses a date older than 30 days or more than 5 minutes ahead', () => {
+    expect(validateInPersonSale(b('2026-09-29T11:00:00Z'), now)).toMatchObject({ ok: false, code: 'INVALID_SOLD_AT' })
+    expect(validateInPersonSale(b('2026-10-30T12:06:00Z'), now)).toMatchObject({ ok: false, code: 'INVALID_SOLD_AT' })
+  })
+})

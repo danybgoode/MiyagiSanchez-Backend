@@ -121,6 +121,18 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         otherVariantId = other.variants[0].id
       })
 
+      // RAW available (stocked − reserved), never clamped — getProductAvailableQuantity
+      // floors at 0 and would hide a negative level (verifier, PR 220).
+      async function stockedOf(container: any, vId: string): Promise<number> {
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'variant',
+          fields: ['inventory_items.inventory.location_levels.stocked_quantity', 'inventory_items.inventory.location_levels.reserved_quantity'],
+          filters: { id: vId },
+        })
+        const lvl = (data[0] as any).inventory_items[0].inventory.location_levels[0]
+        return Number(lvl.stocked_quantity) - Number(lvl.reserved_quantity)
+      }
+
       const sale = (over: Record<string, unknown> = {}) => {
         const r = validateInPersonSale({ client_id: uuid(), kind: 'cash', lines: [{ variant_id: variantId, quantity: 2 }], tendered_cents: 50000, ...over })
         if (!r.ok) throw new Error(r.code)
@@ -261,6 +273,60 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         // The resend CREATED the order, so it is not a replay (D4).
         expect(fixed.body.replayed).toBe(false)
         expect(fixed.status).toBe(201)
+      })
+
+      it('an OFFLINE cash sale past the stock is recorded anyway and flagged (D12), exactly once', async () => {
+        const container = getContainer()
+        const s = sale({ lines: [{ variant_id: variantId, quantity: 7 }], tendered_cents: null, offline: true, sold_at: new Date(Date.now() - 3600_000).toISOString() })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(`${r.code}: ${r.message}`)
+        expect(r.status).toBe(201)
+        expect(r.body.total_cents).toBe(7 * 15000)
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'order', fields: ['id', 'metadata'], filters: { id: r.body.order_id },
+        })
+        const meta = (data[0] as any).metadata
+        expect(meta.source).toBe('in_person')
+        expect(meta.payment_received).toBe(true)
+        expect(meta.in_person.offline).toBe(true)
+        expect(meta.oversold.lines).toEqual([{ variant_id: variantId, quantity: 7, decrement: 5, shortfall: 2 }])
+        // Stock went to zero, not below — read RAW (getProductAvailableQuantity clamps at 0
+        // and would hide a negative level; verifier, PR 220).
+        expect(await stockedOf(container, variantId)).toBe(0)
+        // A resend from the device's queue returns the same order and takes nothing more.
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        if (!again.ok) throw new Error(again.code)
+        expect(again.body.order_id).toBe(r.body.order_id)
+        expect(again.body.replayed).toBe(true)
+        expect(await stockedOf(container, variantId)).toBe(0)
+      })
+
+      it('a stale claim whose fallback already recorded the order ADOPTS it — even after a restock (verifier, PR 220)', async () => {
+        const container = getContainer()
+        const knex: any = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+        const s = sale({ lines: [{ variant_id: variantId, quantity: 7 }], tendered_cents: null, offline: true })
+        const first = await recordInPersonSale(container as any, sellerId, s)
+        if (!first.ok) throw new Error(first.code)
+        // Simulate the crash window: order recorded, claim never settled, now stale.
+        await knex.raw(
+          `update in_person_sale set status = 'claimed', order_id = null, claimed_at = to_timestamp(0) where seller_id = ? and client_id = ?`,
+          [sellerId, s.client_id])
+        // Restock: on the plain cart path this resend would now SUCCEED as a second order.
+        const { data: inv } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'variant', fields: ['inventory_items.inventory_item_id'], filters: { id: variantId },
+        })
+        const itemId = (inv[0] as any).inventory_items[0].inventory_item_id
+        const [lvl] = await (container.resolve(Modules.INVENTORY) as any).listInventoryLevels({ inventory_item_id: itemId })
+        await (container.resolve(Modules.INVENTORY) as any).adjustInventory(itemId, lvl.location_id, 10)
+        const before = await stockedOf(container, variantId)
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        if (!again.ok) throw new Error(`${again.code}: ${again.message}`)
+        expect(again.body.order_id).toBe(first.body.order_id)
+        expect(again.body.replayed).toBe(true)
+        expect(await stockedOf(container, variantId)).toBe(before)
+        const orders = await knex.raw(
+          `select id from "order" where metadata->'in_person'->>'client_id' = ? and deleted_at is null`, [s.client_id])
+        expect(orders.rows).toHaveLength(1)
       })
 
       it('more than the stock on hand is refused online (OUT_OF_STOCK) and the claim is closed', async () => {

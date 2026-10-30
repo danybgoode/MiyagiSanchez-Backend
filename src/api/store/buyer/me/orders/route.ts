@@ -70,6 +70,10 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   }
 
   // ── Normalize (multi-seller; frontend enriches seller from Supabase) ──────
-  const normalized = orders.map((o) => normalizeMedusaOrder(o, '', ''))
+  // Seller-only fields never reach the buyer (in-person oversell shortfalls; verifier, PR 460).
+  const normalized = orders.map((o) => {
+    const { in_person_oversold: _sellerOnly, ...forBuyer } = normalizeMedusaOrder(o, '', '')
+    return forBuyer
+  })
   return res.json({ orders: normalized, customer_ids: customerIds })
 }
