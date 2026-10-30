@@ -328,7 +328,6 @@ export async function recordInPersonSale(
   const token = randomUUID()
   let claimId: string
   let existingCartId: string | null = null
-  let replayed = false
   const insertedId = await insertClaim(scope, {
     seller_id: sellerId,
     client_id: sale.client_id,
@@ -419,7 +418,7 @@ export async function recordInPersonSale(
     // become one (a crash between completion and the claim update). A takeover that
     // creates the first order is not a replay.
     const priorOrderId = await orderForCart(scope, cartId)
-    replayed = priorOrderId != null
+    const replayed = priorOrderId != null
     const amountCents = await prepareCartForCash(scope, cartId)
     if (!priorOrderId && cashChange(amountCents, sale.tendered_cents).short_cents > 0) {
       // Refused before the order exists. The claim is released, not failed: the
