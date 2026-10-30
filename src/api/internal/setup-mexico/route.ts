@@ -36,16 +36,10 @@ import {
   deleteRegionsWorkflow,
 } from '@medusajs/medusa/core-flows'
 import { describeRegionKeep, planRegionDeletions } from '../_utils/market-protected-resources'
+import { MX_PAYMENT_PROVIDERS } from '../../../lib/mx-payment-providers'
 
 // All payment providers that should be enabled on the Mexico region. Keeping
 // pp_system_default for backward-compat with any legacy sessions.
-const MX_PAYMENT_PROVIDERS = [
-  'pp_system_default',
-  'pp_stripe-connect_stripe-connect',
-  'pp_mercadopago_mercadopago',
-  'pp_spei_spei',
-  'pp_cash_cash',
-]
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const secret = req.headers['x-internal-secret']
