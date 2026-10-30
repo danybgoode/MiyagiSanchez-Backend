@@ -231,3 +231,32 @@ export function counterCartMatchesClaim(
   }
   return true
 }
+
+/**
+ * Which public store requests would MUTATE a cart or its payment — the routes a counter
+ * cart must refuse once the merchant rang it up (in-person-sales D8, codex rounds 5–9:
+ * every attack on a counter sale began with someone holding its cart id calling these).
+ *
+ * Returns the cart id the request targets, `{ collectionId }` for the payment-session
+ * route (the caller resolves its cart), `{ bodyCart: true }` for collection creation
+ * (cart id in the body), or null when the request is not a cart mutation. Our own
+ * routes that must keep working on counter carts are excluded by name: completion (the
+ * webhook and the transfer path), start-checkout and mp-authorize (both guard counter
+ * carts themselves). Reads are never mutations.
+ */
+export type CartMutationTarget = { cartId: string } | { collectionId: string } | { bodyCart: true } | null
+
+const OPEN_CART_ACTIONS = new Set(['complete', 'start-checkout', 'mp-authorize'])
+
+export function cartMutationTarget(method: string, path: string): CartMutationTarget {
+  const m = method.toUpperCase()
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return null
+  const clean = path.split('?')[0].replace(/\/+$/, '')
+  const pc = clean.match(/^\/store\/payment-collections\/([^/]+)\/payment-sessions$/)
+  if (pc) return { collectionId: pc[1] }
+  if (clean === '/store/payment-collections') return { bodyCart: true }
+  const c = clean.match(/^\/store\/carts\/([^/]+)(?:\/([^/]+))?/)
+  if (!c) return null
+  if (c[2] && OPEN_CART_ACTIONS.has(c[2])) return null
+  return { cartId: c[1] }
+}

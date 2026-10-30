@@ -77,8 +77,16 @@ async function orderForCart(scope: Scope, cartId: string): Promise<string | null
   return (data?.[0] as any)?.order_id ?? null
 }
 
-/** The payment session start-checkout opened on this cart, if any. */
-async function cartCheckout(scope: Scope, cartId: string): Promise<{ total: number; session: { provider_id: string; data: Record<string, unknown> } | null }> {
+/**
+ * The payment session start-checkout opened on this cart. With a recorded checkout ref,
+ * ONLY the session carrying that ref counts — never "the last session", which a cart
+ * holder could have added with their own redirect URL (codex security lens, PR 218).
+ */
+async function cartCheckout(
+  scope: Scope,
+  cartId: string,
+  recordedRef?: string | null,
+): Promise<{ total: number; session: { provider_id: string; data: Record<string, unknown> } | null }> {
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
   const { data } = await query.graph({
     entity: 'cart',
@@ -87,7 +95,9 @@ async function cartCheckout(scope: Scope, cartId: string): Promise<{ total: numb
   })
   const cart = data?.[0] as any
   const sessions = (cart?.payment_collection?.payment_sessions ?? []) as any[]
-  const s = sessions[sessions.length - 1]
+  const s = recordedRef
+    ? sessions.find((x) => x?.data?.stripe_session_id === recordedRef || x?.data?.mp_preference_id === recordedRef)
+    : sessions[sessions.length - 1]
   return {
     total: Math.round(Number(cart?.total ?? 0)),
     session: s ? { provider_id: String(s.provider_id), data: (s.data ?? {}) as Record<string, unknown> } : null,
@@ -135,7 +145,9 @@ export async function getInPersonSaleStatus(scope: Scope, sellerId: string, clie
 
   let checkoutUrl: string | null = null
   if (claim.cart_id && !orderId) {
-    const c = await cartCheckout(scope, claim.cart_id)
+    const ref = (claim.metadata as any)?.checkout_ref as string | undefined
+    // No recorded checkout yet ⇒ no QR to show (the fence records it on success).
+    const c = await cartCheckout(scope, claim.cart_id, ref ?? '__none__')
     total = c.total
     const url = c.session?.data?.redirect_url
     checkoutUrl = typeof url === 'string' ? url : null
@@ -210,13 +222,13 @@ async function cancelInPersonSaleUnlocked(scope: Scope, sellerId: string, client
     } else {
       const recordedProvider = (claim.metadata as any)?.checkout_provider as string | undefined
       const recordedRef = (claim.metadata as any)?.checkout_ref as string | undefined
-      const { session: currentSession } = await cartCheckout(scope, claim.cart_id)
-      // The checkout this sale OPENED is the server's own record (start-checkout's fence);
-      // the cart's current session can be swapped through the public payment-session
-      // route, so it is used only when nothing was recorded (codex security lens, PR 218).
+      // The checkout this sale OPENED is the server's own record (start-checkout's fence).
+      // Its account context comes from the session that carries that ref — never merged
+      // from another session (a forged one could point expiry at the wrong account).
+      const { session: recordedSession } = recordedRef ? await cartCheckout(scope, claim.cart_id, recordedRef) : { session: null }
       const session = recordedProvider && recordedRef
-        ? { provider_id: recordedProvider, data: { ...(currentSession?.data ?? {}), stripe_session_id: recordedRef, mp_preference_id: recordedRef } }
-        : currentSession
+        ? { provider_id: recordedProvider, data: { ...(recordedSession?.data ?? {}), stripe_session_id: recordedRef, mp_preference_id: recordedRef } }
+        : (await cartCheckout(scope, claim.cart_id)).session
       if (!session) {
         // Started but not yet linked: the QR is being created right now. Only a start
         // that clearly died (no session after CHECKOUT_OPEN_STALE_MS) may be closed.

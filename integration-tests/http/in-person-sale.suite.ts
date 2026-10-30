@@ -32,7 +32,7 @@ const uuid = () => crypto.randomUUID()
  * Map.prototype.set called on incompatible receiver" (verifier, PR #214). One runner,
  * one app boot, both suites.
  */
-export function inPersonSaleSuite(getContainer: () => any) {
+export function inPersonSaleSuite(getContainer: () => any, api: any) {
     describe('in-person cash sale — one real order, exactly once', () => {
       let sellerId: string
       let otherSellerId: string
@@ -317,7 +317,8 @@ export function inPersonSaleSuite(getContainer: () => any) {
         if (!r.ok) throw new Error(r.code)
         let refused: string | null = null
         try { await payCart(container, r.body.cart_id!) } catch (e) { refused = String((e as Error).message) }
-        expect(refused).toMatch(/cannot be completed with pp_cash_cash/)
+        // Refused by the recorded-checkout rule or the provider rule, whichever runs first.
+        expect(refused).toMatch(/no recorded checkout|cannot be completed with pp_cash_cash/)
         const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
         expect(status?.state).toBe('awaiting_payment')
         expect(status?.order_id).toBeNull()
@@ -369,6 +370,27 @@ export function inPersonSaleSuite(getContainer: () => any) {
         let refused: string | null = null
         try { await completeCartWorkflow(container).run({ input: { id: cartId } }) } catch (e) { refused = String((e as Error).message) }
         expect(refused).toMatch(/was closed/)
+      })
+
+      it('a counter cart cannot be edited or re-paid through Medusa\'s public routes (COUNTER_CART_LOCKED)', async () => {
+        const container = getContainer()
+        const [key] = await (container.resolve(Modules.API_KEY) as any).createApiKeys([{ title: 'pk', type: 'publishable', created_by: 't' }])
+        await container.resolve(ContainerRegistrationKeys.LINK).create({
+          [Modules.API_KEY]: { publishable_key_id: key.id },
+          [Modules.SALES_CHANNEL]: { sales_channel_id: channelId },
+        })
+        const headers = { 'x-publishable-api-key': key.token }
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        const status = async (fn: () => Promise<unknown>) => {
+          try { await fn(); return 200 } catch (e) { return (e as any)?.response?.status }
+        }
+        expect(await status(() => api.post(`/store/carts/${r.body.cart_id}/line-items`, { variant_id: variantId, quantity: 1 }, { headers }))).toBe(409)
+        expect(await status(() => api.post(`/store/carts/${r.body.cart_id}`, { metadata: { source: null } }, { headers }))).toBe(409)
+        expect(await status(() => api.post('/store/payment-collections', { cart_id: r.body.cart_id }, { headers }))).toBe(409)
+        // Reading it is fine.
+        expect(await status(() => api.get(`/store/carts/${r.body.cart_id}`, { headers }))).toBe(200)
       })
 
       it('an unpaid card sale cancels, and a cancelled sale cannot be resent', async () => {

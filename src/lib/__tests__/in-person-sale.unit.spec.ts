@@ -205,3 +205,28 @@ describe('counterCartMatchesClaim (codex security lens, PR 218)', () => {
     expect(counterCartMatchesClaim(cart({ items: [] }), claim)).toBe(false)
   })
 })
+
+describe('cartMutationTarget (counter carts are server-owned)', () => {
+  const { cartMutationTarget } = require('../in-person-sale')
+  it.each([
+    ['POST', '/store/carts/cart_1', { cartId: 'cart_1' }],
+    ['POST', '/store/carts/cart_1/line-items', { cartId: 'cart_1' }],
+    ['DELETE', '/store/carts/cart_1/line-items/li_1', { cartId: 'cart_1' }],
+    ['POST', '/store/carts/cart_1/promotions', { cartId: 'cart_1' }],
+    ['POST', '/store/carts/cart_1/shipping-methods', { cartId: 'cart_1' }],
+    ['POST', '/store/payment-collections/pc_1/payment-sessions', { collectionId: 'pc_1' }],
+    ['POST', '/store/payment-collections', { bodyCart: true }],
+  ])('%s %s is a mutation', (m, p, expected) => {
+    expect(cartMutationTarget(m, p)).toEqual(expected)
+  })
+  it.each([
+    ['GET', '/store/carts/cart_1'],
+    ['POST', '/store/carts/cart_1/complete'],
+    ['POST', '/store/carts/cart_1/start-checkout'],
+    ['POST', '/store/carts/cart_1/mp-authorize'],
+    ['POST', '/store/carts'],
+    ['POST', '/store/sellers/me/in-person-orders'],
+  ])('%s %s is not', (m, p) => {
+    expect(cartMutationTarget(m, p)).toBeNull()
+  })
+})
