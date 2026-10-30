@@ -369,6 +369,7 @@ export async function recordInPersonSale(
   const token = randomUUID()
   let claimId: string
   let existingCartId: string | null = null
+  let resumeOversold = false
   const insertedId = await insertClaim(scope, {
     seller_id: sellerId,
     client_id: sale.client_id,
@@ -417,12 +418,53 @@ export async function recordInPersonSale(
         if (!won) return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
         claimId = existing.id
         existingCartId = won.cart_id
+        // A previous attempt reached the D12 fallback: its order may already exist
+        // OUTSIDE any cart. Resume THAT path (it adopts the order and finishes stock and
+        // ledger) — the cart path cannot see it, and with stock back it would complete a
+        // second order (verifier, PR 220).
+        resumeOversold = Boolean((existing.metadata as any)?.oversold_fallback_at)
         break
       }
     }
   }
 
+  // D12 fallback, shared by a stock refusal and by a takeover that resumes it.
+  const runOversoldFallback = async (): Promise<RecordResult> => {
+    try {
+      const { orderId, totalCents, oversold, adopted } = await recordOversoldOfflineSale(scope, {
+        sellerId, sale, regionId, channelId,
+        email: PLACEHOLDER_BUYER_EMAIL,
+        soldAt: sale.sold_at ?? now.toISOString(),
+        claimId, claimToken: token,
+      })
+      const { change_cents, short_cents } = cashChange(totalCents, sale.tendered_cents)
+      // Token-conditional: only the current owner settles the claim.
+      await knexOf(scope).raw(
+        `update in_person_sale
+            set status = 'completed', order_id = ?, oversold = ?, updated_at = now(),
+                metadata = coalesce(metadata, '{}'::jsonb) || ?::jsonb
+          where id = ? and claim_token = ?`,
+        [orderId, oversold.length > 0, JSON.stringify({
+          tendered_cents: sale.tendered_cents, change_cents, total_cents: totalCents, oversold,
+          // The sale happened, so it is recorded even if the cash noted was short — but
+          // the merchant sees it (verifier, PR 220).
+          ...(short_cents > 0 ? { short_cents } : {}),
+        }), claimId, token],
+      )
+      return { ok: true, status: adopted ? 200 : 201, body: { order_id: orderId, total_cents: totalCents, change_cents, replayed: adopted } }
+    } catch (fallbackError) {
+      if (fallbackError instanceof OversoldOwnershipLost) {
+        return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
+      }
+      // Not a refusal: the sale happened. Keep the claim retryable (the queue resends).
+      await releaseClaim(scope, claimId, token).catch(() => {})
+      console.error('[in-person] offline oversell fallback failed', { claimId, message: (fallbackError as Error)?.message })
+      return refuse(503, 'RETRY_SAME_ID', 'No se pudo registrar la venta sin señal. Se reintentará.')
+    }
+  }
+
   // ── apply ────────────────────────────────────────────────────────────────────
+  if (resumeOversold) return runOversoldFallback()
   try {
     let cartId = existingCartId
     if (!cartId) {
@@ -523,31 +565,7 @@ export async function recordInPersonSale(
       // D12: an OFFLINE cash sale already happened — record it anyway, decrement what
       // stock has, and flag the shortfall (in-person-sale-oversold.ts). Online sales keep
       // the normal refusal below.
-      try {
-        const { orderId, totalCents, oversold } = await recordOversoldOfflineSale(scope, {
-          sellerId, sale, regionId, channelId,
-          email: PLACEHOLDER_BUYER_EMAIL,
-          soldAt: sale.sold_at ?? now.toISOString(),
-          claimId, claimToken: token,
-        })
-        const { change_cents } = cashChange(totalCents, sale.tendered_cents)
-        await inPerson.updateInPersonSales({
-          id: claimId,
-          status: 'completed',
-          order_id: orderId,
-          oversold: oversold.length > 0,
-          metadata: { tendered_cents: sale.tendered_cents, change_cents, total_cents: totalCents, oversold },
-        })
-        return { ok: true, status: 201, body: { order_id: orderId, total_cents: totalCents, change_cents, replayed: false } }
-      } catch (fallbackError) {
-        if (fallbackError instanceof OversoldOwnershipLost) {
-          return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
-        }
-        // Not a refusal: the sale happened. Keep the claim retryable (the queue resends).
-        await releaseClaim(scope, claimId, token).catch(() => {})
-        console.error('[in-person] offline oversell fallback failed', { claimId, message: (fallbackError as Error)?.message })
-        return refuse(503, 'RETRY_SAME_ID', 'No se pudo registrar la venta sin señal. Se reintentará.')
-      }
+      return runOversoldFallback()
     }
     if (isStockError(e)) {
       // A definitive refusal: this sale can never complete as rung up. Close the

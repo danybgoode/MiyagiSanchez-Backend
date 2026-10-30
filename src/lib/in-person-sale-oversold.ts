@@ -57,7 +57,7 @@ export async function recordOversoldOfflineSale(
     claimId: string
     claimToken: string
   },
-): Promise<{ orderId: string; totalCents: number; oversold: ReturnType<typeof planOversoldDecrement> }> {
+): Promise<{ orderId: string; totalCents: number; oversold: ReturnType<typeof planOversoldDecrement>; adopted: boolean }> {
   const { sellerId, sale } = input
   const query = scope.resolve(ContainerRegistrationKeys.QUERY)
   const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
@@ -71,15 +71,19 @@ export async function recordOversoldOfflineSale(
   // and the existing-order lookup sees whatever the previous holder created. The lock's
   // timeout is generous because Medusa uses it as the key's TTL too.
   const locking = scope.resolve(Modules.LOCKING)
+  let adopted = false
   const orderId: string = await locking.execute(`in-person-oversold:${input.claimId}`, async () => {
     const fenced = await knex.raw(
-      `update in_person_sale set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('oversold_fallback_at', now()::text), updated_at = now()
+      // Renews the lease (claimed_at) too, so a fresh owner is not judged stale mid-run.
+      `update in_person_sale set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('oversold_fallback_at', now()::text),
+              claimed_at = now(), updated_at = now()
         where id = ? and claim_token = ? and status = 'claimed' returning id`,
       [input.claimId, input.claimToken],
     )
     if (!(fenced?.rows?.length)) throw new OversoldOwnershipLost()
 
     let orderId = await existingOrderFor(scope, sellerId, sale.client_id)
+    adopted = Boolean(orderId)
     if (!orderId) {
       // Prices the way a cart would price them: the variant's calculated price in the MX region.
       const { data: variants } = await query.graph({
@@ -144,7 +148,7 @@ export async function recordOversoldOfflineSale(
   await appendOrderLedger(scope as never, orderId)
 
   const { data: totals } = await query.graph({ entity: 'order', fields: ['id', 'total'], filters: { id: orderId } })
-  return { orderId, totalCents: Math.round(Number((totals?.[0] as any)?.total ?? 0)), oversold }
+  return { orderId, adopted, totalCents: Math.round(Number((totals?.[0] as any)?.total ?? 0)), oversold }
 }
 
 /**
