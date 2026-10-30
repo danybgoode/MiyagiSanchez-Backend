@@ -33,6 +33,9 @@ export interface InPersonSaleInput {
   buyer_email: string | null
 }
 
+export const SOLD_AT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+export const SOLD_AT_MAX_SKEW_MS = 5 * 60 * 1000
+
 // D3 caps. 50 lines is far beyond a stall sale and bounds the work one request can ask for.
 export const MAX_LINES = 50
 export const MAX_QUANTITY = 999
@@ -54,7 +57,7 @@ function fail(code: string, message: string): ValidationResult {
  * (two taps on the same product are one line of quantity 2), so the payload hash
  * below cannot differ between two spellings of the same sale.
  */
-export function validateInPersonSale(body: unknown): ValidationResult {
+export function validateInPersonSale(body: unknown, now: Date = new Date()): ValidationResult {
   if (!body || typeof body !== 'object') return fail('INVALID_BODY', 'Falta la venta.')
   const b = body as Record<string, unknown>
 
@@ -104,6 +107,12 @@ export function validateInPersonSale(body: unknown): ValidationResult {
   if (b.sold_at != null) {
     const d = typeof b.sold_at === 'string' ? new Date(b.sold_at) : null
     if (!d || Number.isNaN(d.getTime())) return fail('INVALID_SOLD_AT', 'Fecha de venta no válida.')
+    // An offline sale syncs within days, and phone clocks drift a little: anything older
+    // than 30 days or more than 5 minutes ahead is not a counter sale's real time
+    // (verifier, PR 460 — sold_at was unbounded).
+    if (d.getTime() < now.getTime() - SOLD_AT_MAX_AGE_MS || d.getTime() > now.getTime() + SOLD_AT_MAX_SKEW_MS) {
+      return fail('INVALID_SOLD_AT', 'La fecha de la venta no es válida.')
+    }
     soldAt = d.toISOString()
   }
 

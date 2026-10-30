@@ -86,5 +86,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     } catch { /* seller enrichment is best-effort */ }
   }
 
-  return res.json({ order: normalizeMedusaOrder(order, sellerId, sellerName, sellerClerkUserId) })
+  // Seller-only fields never reach the buyer (in-person oversell shortfalls; verifier, PR 460).
+  const { in_person_oversold: _sellerOnly, ...forBuyer } = normalizeMedusaOrder(order, sellerId, sellerName, sellerClerkUserId)
+  return res.json({ order: forBuyer })
 }
