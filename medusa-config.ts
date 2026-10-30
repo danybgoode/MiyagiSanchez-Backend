@@ -160,6 +160,11 @@ module.exports = defineConfig({
       resolve: './src/modules/profit',
     },
 
+    // ── In-person module (counter-sale exactly-once claims; payment links in S4) ──
+    {
+      resolve: './src/modules/in-person',
+    },
+
     // ── Auth providers ─────────────────────────────────────────────────────────
     {
       resolve: '@medusajs/medusa/auth',
