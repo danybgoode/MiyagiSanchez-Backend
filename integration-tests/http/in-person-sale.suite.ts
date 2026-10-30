@@ -20,6 +20,8 @@ import { recordInPersonSale } from '../../src/lib/in-person-sale-apply'
 import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
 import { getInPersonSaleStatus, cancelInPersonSale } from '../../src/lib/in-person-sale-status'
+import { createPaymentLink, cancelPaymentLink } from '../../src/lib/payment-link-apply'
+import { buildPaymentLinkCart, publicPaymentLink } from '../../src/lib/payment-link-cart'
 import { completeCartWorkflow, createPaymentCollectionForCartWorkflow } from '@medusajs/medusa/core-flows'
 
 
@@ -467,6 +469,85 @@ export function inPersonSaleSuite(getContainer: () => any, api: any) {
         expect(cancel.ok && cancel.status.state).toBe('cancelled')
         const again = await recordInPersonSale(container as any, sellerId, s)
         expect(!again.ok && again.code).toBe('SALE_CLOSED')
+      })
+
+      // ── S4 · payment links (D13–D15) ──────────────────────────────────────────
+      async function payOnManual(container: any, cartId: string) {
+        await container.resolve(Modules.CART).addShippingMethods(cartId, [{
+          name: 'Entrega', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cartId } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_manual_manual', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        const { result } = await completeCartWorkflow(container).run({ input: { id: cartId } })
+        return (result as any).id as string
+      }
+      async function linkRow(container: any, id: string) {
+        const [row] = await (container.resolve(IN_PERSON_MODULE) as any).listPaymentLinks({ id }, { take: 1 })
+        return row
+      }
+
+      it('a free-amount link: server-priced cart on the hidden product, paid once, then closed', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Anticipo pastel', amount_cents: 80000 })
+        if (!made.ok) throw new Error(`${made.code}: ${made.message}`)
+        const view = await publicPaymentLink(container as any, made.body.token)
+        if (!view.ok) throw new Error(view.code)
+        expect(view.body).toMatchObject({ state: 'pending', kind: 'amount', concept: 'Anticipo pastel', total_cents: 80000 })
+        expect(JSON.stringify(view.body)).not.toContain(sellerId)
+
+        const cart = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!cart.ok) throw new Error(`${cart.code}: ${cart.message}`)
+        expect(cart.body.total_cents).toBe(80000)
+        const orderId = await payOnManual(container, cart.body.cart_id)
+        expect(orderId).toBeTruthy()
+        // The order is the seller's (its line is on a product the seller owns).
+        const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({
+          entity: 'order', fields: ['id', 'total', 'items.title', 'items.product_id'], filters: { id: orderId },
+        })
+        expect((data[0] as any).items[0].title).toBe('Anticipo pastel')
+        expect(Math.round(Number((data[0] as any).total))).toBe(80000)
+
+        // order.placed → the link is paid (the subscriber runs after the workflow).
+        let row: any
+        for (let i = 0; i < 30; i++) { row = await linkRow(container, made.body.id); if (row.status === 'paid') break; await new Promise((r) => setTimeout(r, 100)) }
+        expect(row.status).toBe('paid')
+        expect(row.paid_order_ids).toEqual([orderId])
+        const again = await buildPaymentLinkCart(container as any, made.body.token)
+        expect(!again.ok && again.code).toBe('LINK_PAID')
+      })
+
+      it('a multi-use product link gives every opener a fresh cart', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'products', uses: 'multi', lines: [{ variant_id: variantId, quantity: 1 }] })
+        if (!made.ok) throw new Error(made.code)
+        const a = await buildPaymentLinkCart(container as any, made.body.token)
+        const b = await buildPaymentLinkCart(container as any, made.body.token)
+        if (!a.ok || !b.ok) throw new Error('expected two carts')
+        expect(a.body.cart_id).not.toBe(b.body.cart_id)
+        expect(a.body.total_cents).toBe(15000)
+      })
+
+      it('expired and cancelled links cannot be paid; another seller cannot cancel a link', async () => {
+        const container = getContainer()
+        const made = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Envío especial', amount_cents: 25000 })
+        if (!made.ok) throw new Error(made.code)
+        expect(await cancelPaymentLink(container as any, otherSellerId, made.body.id)).toMatchObject({ ok: false, status: 404 })
+        const c = await cancelPaymentLink(container as any, sellerId, made.body.id)
+        expect(c.ok && c.body.state).toBe('cancelled')
+        expect(await buildPaymentLinkCart(container as any, made.body.token)).toMatchObject({ ok: false, code: 'LINK_CANCELLED' })
+
+        const old = await createPaymentLink(container as any, sellerId, { kind: 'amount', concept: 'Viejo', amount_cents: 25000 })
+        if (!old.ok) throw new Error(old.code)
+        await (container.resolve(IN_PERSON_MODULE) as any).updatePaymentLinks({ id: old.body.id, expires_at: new Date(Date.now() - 1000) })
+        expect(await buildPaymentLinkCart(container as any, old.body.token)).toMatchObject({ ok: false, code: 'LINK_EXPIRED' })
+      })
+
+      it("a product link refuses another seller's variant", async () => {
+        const container = getContainer()
+        const r = await createPaymentLink(container as any, sellerId, { kind: 'products', lines: [{ variant_id: otherVariantId }] })
+        expect(!r.ok && r.code).toBe('VARIANT_NOT_OWNED')
       })
     })
 }

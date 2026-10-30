@@ -13,6 +13,8 @@ import { completeCartWorkflow } from '@medusajs/medusa/core-flows'
 import { MedusaError } from '@medusajs/framework/utils'
 import { IN_PERSON_MODULE } from '../../modules/in-person'
 import { counterCartMatchesClaim, disallowedCounterProviders } from '../../lib/in-person-sale'
+import { LINK_HASH_KIND } from '../../lib/payment-link-cart'
+import { derivePaymentLinkState } from '../../lib/payment-link'
 import { SELLER_MODULE } from '../../modules/seller'
 import { resolveSellerMpToken } from '../../api/store/_utils/mp'
 
@@ -35,12 +37,47 @@ async function assertMpPaymentIsThisCart(container: any, sellerId: string, mpPay
   }
 }
 
+/**
+ * A payment-link cart (S4, D15) completes only as built (lines + recorded total), only on
+ * a card provider or the manual provider, and — once its link is closed (paid single-use,
+ * expired, cancelled) — only with processor-confirmed money: the manual provider
+ * authorizes unconditionally, so it could otherwise mint an order on a closed link.
+ * Mercado Pago payments are proved to be for THIS cart, in full (as counter carts).
+ */
+async function validatePaymentLinkCart(container: any, inPerson: any, cart: any, cartId: string): Promise<void> {
+  const [lc] = await inPerson.listPaymentLinkCarts({ cart_id: cartId }, { take: 1 })
+  if (!lc) return
+  if (!counterCartMatchesClaim(
+    { total: cart?.total, items: (cart?.items ?? []) as any[] },
+    { kind: LINK_HASH_KIND, payload_hash: String(lc.payload_hash), total_cents: Number(lc.total_cents) },
+  )) {
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment-link cart changed after it was built.')
+  }
+  const [link] = await inPerson.listPaymentLinks({ id: lc.payment_link_id }, { take: 1 })
+  const open = link && derivePaymentLinkState(link, new Date()) === 'pending'
+  const sessions = ((cart?.payment_collection?.payment_sessions ?? []) as Array<{ status?: string; provider_id?: string; data?: any }>)
+    .filter((s) => PROCESSABLE.has(String(s?.status)))
+  for (const s of sessions) {
+    const p = String(s.provider_id)
+    if (p === 'pp_manual_manual') {
+      if (!open) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This payment link is closed.')
+      continue
+    }
+    if (p === 'pp_stripe-connect_stripe-connect') continue // the provider proves Stripe paid THIS session (stripe-authorization.ts)
+    if (p === 'pp_mercadopago_mercadopago') {
+      await assertMpPaymentIsThisCart(container, String(lc.seller_id), String(s?.data?.mp_payment_id ?? ''), cartId, Number(cart?.total ?? NaN))
+      continue
+    }
+    throw new MedusaError(MedusaError.Types.NOT_ALLOWED, `A payment link cannot be completed with ${p}.`)
+  }
+}
+
 completeCartWorkflow.hooks.validate(async ({ cart }, { container }) => {
   const cartId = (cart as any)?.id
   if (!cartId) return
   const inPerson: any = container.resolve(IN_PERSON_MODULE)
   const [claim] = await inPerson.listInPersonSales({ cart_id: cartId }, { take: 1 })
-  if (!claim) return
+  if (!claim) return validatePaymentLinkCart(container, inPerson, cart, cartId)
   // A closed sale cannot become an order — except a CARD sale, whose provider authorizes
   // only a payment the processor confirmed: money already taken must still become its
   // order (never hidden). Transfer/cash authorize unconditionally, so after a cancel

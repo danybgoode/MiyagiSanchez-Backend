@@ -21,6 +21,7 @@ import { SELLER_MODULE } from '../../../../../modules/seller'
 import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
 import { CHECKOUT_OPEN_STALE_MS, expireCounterCheckout } from '../../../../../lib/in-person-sale-status'
 import { counterCartMatchesClaim } from '../../../../../lib/in-person-sale'
+import { LINK_HASH_KIND, linkCartFor } from '../../../../../lib/payment-link-cart'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
@@ -478,7 +479,37 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // `offer_amount_cents: 1` underpaid a server-priced counter sale). Every cart is
   // looked up in the claim table by id; a cart with a claim IS a counter cart.
   const serverClaim = await serverBuiltCart(req, cartId)
-  const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? 'in_person' : null
+  // Payment links (S4, D15): the server's `payment_link_cart` record, same rule.
+  const linkCart = serverClaim ? null : await linkCartFor(req.scope, cartId)
+  const serverCartSource: 'in_person' | 'payment_link' | null = serverClaim ? 'in_person' : linkCart ? 'payment_link' : null
+  if (linkCart) {
+    // One checkout per link cart — the pay page builds a fresh cart per attempt.
+    if (await cartHasPaymentCollection(req, cartId)) {
+      return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
+    }
+    const { data: lc } = await req.scope.resolve(ContainerRegistrationKeys.QUERY).graph({
+      entity: 'cart', fields: ['id', 'total', 'items.variant_id', 'items.quantity'], filters: { id: cartId },
+    })
+    if (!counterCartMatchesClaim(
+      { total: (lc?.[0] as any)?.total, items: ((lc?.[0] as any)?.items ?? []) },
+      { kind: LINK_HASH_KIND, payload_hash: String(linkCart.payload_hash), total_cents: Number(linkCart.total_cents) },
+    )) {
+      return res.status(409).json({ code: 'CART_CHANGED', message: 'Este cobro cambió. Vuelve a abrir el link.' })
+    }
+    // The money goes to the LINK's seller; nothing a buyer sends can redirect it.
+    body.seller_id = String(linkCart.seller_id)
+    body.shipping_quote = undefined
+    body.shipping_address = undefined
+    body.rental = undefined
+    body.escrow = false
+    body.pickup_spot_id = undefined
+    body.pickup_appointment = undefined
+    // D15: a free amount is digital (no delivery); products are handed over as arranged
+    // with the shop — never carrier shipping, which would need a quote the link has not got.
+    const inPersonSvc: any = req.scope.resolve(IN_PERSON_MODULE)
+    const [lk] = await inPersonSvc.listPaymentLinks({ id: linkCart.payment_link_id }, { take: 1 })
+    body.fulfillment_method = lk?.kind === 'amount' ? 'digital' : 'local_pickup'
+  }
   if (serverCartSource === 'in_person') {
     // A counter cart opens exactly ONE payable checkout, and only while its sale waits
     // for payment: a cancelled sale must not become payable again, and a second call
@@ -547,7 +578,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   }
   const isCounterCart = serverCartSource === 'in_person'
   // Payment links (S4) will resolve their id from their own table, like the claim above.
-  const paymentLinkId = null as string | null
+  const paymentLinkId = linkCart ? String(linkCart.payment_link_id) : null
   if (serverCartSource) {
     body.offer_amount_cents = undefined
     body.offer_id = undefined

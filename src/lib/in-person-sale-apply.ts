@@ -81,7 +81,7 @@ function refuse(status: number, code: string, message: string, details?: unknown
  * The proof is keyed to the variant, because the variant is what the cart buys
  * (LEARNINGS: an admission proof must match what is consumed).
  */
-async function assertSellerOwnsVariants(
+export async function assertSellerOwnsVariants(
   scope: Scope,
   sellerId: string,
   variantIds: string[],
