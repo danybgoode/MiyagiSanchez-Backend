@@ -19,6 +19,8 @@ import { setupFulfillmentInfrastructure } from '../../src/api/store/_utils/fulfi
 import { recordInPersonSale } from '../../src/lib/in-person-sale-apply'
 import { validateInPersonSale } from '../../src/lib/in-person-sale'
 import { getProductAvailableQuantity } from '../../src/api/store/_utils/inventory'
+import { getInPersonSaleStatus, cancelInPersonSale } from '../../src/lib/in-person-sale-status'
+import { completeCartWorkflow, createPaymentCollectionForCartWorkflow } from '@medusajs/medusa/core-flows'
 
 
 const uuid = () => crypto.randomUUID()
@@ -266,6 +268,63 @@ export function inPersonSaleSuite(getContainer: () => any) {
         const s = sale({ lines: [{ variant_id: variantId, quantity: 6 }], tendered_cents: null })
         const r = await recordInPersonSale(container as any, sellerId, s)
         expect(!r.ok && r.code).toBe('OUT_OF_STOCK')
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        expect(!again.ok && again.code).toBe('SALE_CLOSED')
+      })
+
+      // ── S2 · card and transfer (D9/D10) ─────────────────────────────────────
+      // A test stand-in for the provider webhook: complete the cart on the cash
+      // provider exactly as a paid checkout would complete it.
+      async function payCart(container: any, cartId: string) {
+        await container.resolve(Modules.CART).addShippingMethods(cartId, [{
+          name: 'Entregado en persona', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cartId } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_cash_cash', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        await completeCartWorkflow(container).run({ input: { id: cartId } })
+      }
+
+      it('a card sale builds ONE cart and waits; a resend returns the same cart', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const first = await recordInPersonSale(container as any, sellerId, s)
+        if (!first.ok) throw new Error(`${first.code}: ${first.message}`)
+        expect(first.status).toBe(201)
+        expect(first.body.status).toBe('awaiting_payment')
+        expect(first.body.order_id).toBeNull()
+        expect(first.body.total_cents).toBe(30000)
+        const again = await recordInPersonSale(container as any, sellerId, s)
+        if (!again.ok) throw new Error(again.code)
+        expect(again.body.cart_id).toBe(first.body.cart_id)
+        expect(again.body.replayed).toBe(true)
+
+        const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
+        expect(status?.state).toBe('awaiting_payment')
+        // Another seller cannot read it.
+        expect(await getInPersonSaleStatus(container as any, otherSellerId, s.client_id)).toBeNull()
+      })
+
+      it('a card sale is PAID only once its cart becomes an order — and a late cancel cannot hide it', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        await payCart(container, r.body.cart_id!)
+        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(cancel.ok && cancel.status.state).toBe('paid')
+        const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
+        expect(status?.state).toBe('paid')
+        expect(status?.order_id).toBeTruthy()
+      })
+
+      it('an unpaid card sale cancels, and a cancelled sale cannot be resent', async () => {
+        const container = getContainer()
+        const s = sale({ kind: 'card', tendered_cents: null })
+        await recordInPersonSale(container as any, sellerId, s)
+        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(cancel.ok && cancel.status.state).toBe('cancelled')
         const again = await recordInPersonSale(container as any, sellerId, s)
         expect(!again.ok && again.code).toBe('SALE_CLOSED')
       })

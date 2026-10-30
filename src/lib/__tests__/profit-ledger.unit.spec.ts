@@ -228,3 +228,21 @@ describe('buildNativeShippingEvent', () => {
     })).toBeNull()
   })
 })
+
+describe('orderSourceOf (in-person-sales D17)', () => {
+  const { orderSourceOf, buildNativeOrderEvents } = require('../profit-ledger')
+  it('maps every known source and defaults the rest to native', () => {
+    expect(orderSourceOf({ source: 'in_person' })).toBe('in_person')
+    expect(orderSourceOf({ source: 'payment_link' })).toBe('payment_link')
+    expect(orderSourceOf({ source: 'mercadolibre' })).toBe('mercadolibre')
+    expect(orderSourceOf({ source: 'something-else' })).toBe('native')
+    expect(orderSourceOf(null)).toBe('native')
+  })
+  it('a counter sale writes its revenue and COGS rows labelled in_person', () => {
+    const events = buildNativeOrderEvents({
+      order_id: 'o', seller_id: 's', currency_code: 'mxn', captured_at: new Date(0), source: 'in_person',
+      lines: [{ line_id: 'l', quantity: 1, unit_price_cents: 100, unit_cost_cents: 40 }],
+    })
+    expect(events.map((e: { source: string }) => e.source)).toEqual(['in_person', 'in_person'])
+  })
+})

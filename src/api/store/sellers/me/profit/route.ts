@@ -2,6 +2,7 @@ import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
 import { ContainerRegistrationKeys } from '@medusajs/framework/utils'
 import { resolveSeller } from '../../../_utils/clerk-auth'
 import { isEnabled } from '../../../../../lib/flags'
+import { orderSourceOf } from '../../../../../lib/profit-ledger'
 import { PROFIT_MODULE } from '../../../../../modules/profit'
 import type ProfitModuleService from '../../../../../modules/profit/service'
 
@@ -49,7 +50,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
         display_id: o.display_id ?? null,
         created_at: o.created_at ?? null,
         currency_code: o.currency_code ?? null,
-        source: (o.metadata as Record<string, unknown> | null)?.source === 'mercadolibre' ? 'mercadolibre' : 'native',
+        source: orderSourceOf(o.metadata),
         items: ((o.items ?? []) as Array<Record<string, unknown>>).map((i) => ({
           id: i.id,
           product_id: i.product_id ?? null,

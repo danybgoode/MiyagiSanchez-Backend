@@ -155,6 +155,8 @@ export interface ExistingClaim {
 
 export type ClaimOutcome =
   | { action: 'replay'; order_id: string }
+  /** A card/transfer sale whose cart is built and waits for its payment (S2, D9/D10). */
+  | { action: 'awaiting'; cart_id: string }
   | { action: 'reject_reused'; }
   | { action: 'in_progress' }
   | { action: 'takeover'; cart_id: string | null }
@@ -170,6 +172,10 @@ export type ClaimOutcome =
 export function decideExistingClaim(existing: ExistingClaim, payloadHash: string, now: Date): ClaimOutcome {
   if (existing.payload_hash !== payloadHash) return { action: 'reject_reused' }
   if (existing.status === 'completed' && existing.order_id) return { action: 'replay', order_id: existing.order_id }
+  // Waiting is a settled state, not an in-flight one: the cart exists and the buyer is
+  // paying. A resend (a reload, a lost answer) gets the same cart back — never a second
+  // cart, which would mean a second checkout the buyer could also pay.
+  if (existing.status === 'awaiting_payment' && existing.cart_id) return { action: 'awaiting', cart_id: existing.cart_id }
   if (existing.status === 'cancelled' || existing.status === 'failed') {
     return { action: 'reject_closed', status: existing.status }
   }

@@ -19,7 +19,19 @@
  * (a partial row the dashboard renders honestly) — never an invented number.
  */
 
-export type LedgerSource = 'mercadolibre' | 'native'
+export type LedgerSource = 'mercadolibre' | 'native' | 'in_person' | 'payment_link'
+
+/**
+ * Where an order was sold, from its `metadata.source` — the ONE mapping the ledger
+ * writer and the Ganancias route both use (in-person-sales D17). Counter sales
+ * (`in_person`) and payment links (`payment_link`) are native Medusa orders with
+ * native revenue/COGS; only the label differs, so Ganancias can split by it.
+ * Anything unrecognised is `native` — the pre-existing default for an online order.
+ */
+export function orderSourceOf(metadata: unknown): LedgerSource {
+  const src = (metadata as Record<string, unknown> | null | undefined)?.source
+  return src === 'mercadolibre' || src === 'in_person' || src === 'payment_link' ? src : 'native'
+}
 export type LedgerEventType = 'revenue' | 'ml_fee' | 'shipping_cost' | 'cogs_snapshot'
 
 export interface LedgerEventInput {
@@ -84,8 +96,11 @@ export function buildNativeOrderEvents(input: {
   currency_code: string
   captured_at: Date
   lines: NativeOrderLine[]
+  /** Counter / link / online — all native orders; defaults to 'native'. */
+  source?: Exclude<LedgerSource, 'mercadolibre'>
 }): LedgerEventInput[] {
   const events: LedgerEventInput[] = []
+  const source = input.source ?? 'native'
   for (const line of input.lines) {
     const qty = Number.isFinite(line.quantity) ? Math.max(0, Math.trunc(line.quantity)) : 0
     const unitCents = Number.isFinite(line.unit_price_cents) ? Math.round(line.unit_price_cents) : 0
@@ -94,7 +109,7 @@ export function buildNativeOrderEvents(input: {
       order_id: input.order_id,
       order_line_id: line.line_id,
       seller_id: input.seller_id,
-      source: 'native',
+      source,
       event_type: 'revenue',
       amount_cents: unitCents * qty,
       currency_code: input.currency_code,
@@ -107,7 +122,7 @@ export function buildNativeOrderEvents(input: {
         order_id: input.order_id,
         order_line_id: line.line_id,
         seller_id: input.seller_id,
-        source: 'native',
+        source,
         event_type: 'cogs_snapshot',
         amount_cents: line.unit_cost_cents * qty,
         currency_code: input.currency_code,

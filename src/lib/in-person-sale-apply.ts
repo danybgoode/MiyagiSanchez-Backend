@@ -55,10 +55,15 @@ export type RecordResult =
       ok: true
       status: 200 | 201
       body: {
-        order_id: string
+        /** Cash: the recorded order. Card/transfer: null until the payment completes the cart. */
+        order_id: string | null
         total_cents: number
         change_cents: number
         replayed: boolean
+        /** Card/transfer (S2): the cart the checkout runs on, and the claim's state. */
+        cart_id?: string
+        status?: 'completed' | 'awaiting_payment'
+        checkout_url?: string | null
       }
     }
   | { ok: false; status: number; code: string; message: string; details?: unknown }
@@ -302,6 +307,25 @@ async function releaseClaim(scope: Scope, claimId: string, token: string): Promi
   )
 }
 
+/** The answer for a card/transfer sale whose cart is built (fresh, resumed or replayed). */
+async function awaitingResult(scope: Scope, claim: any, status: 200 | 201, replayed: boolean): Promise<RecordResult> {
+  const query = scope.resolve(ContainerRegistrationKeys.QUERY)
+  const { data } = await query.graph({ entity: 'cart', fields: ['id', 'total'], filters: { id: claim.cart_id } })
+  return {
+    ok: true,
+    status,
+    body: {
+      order_id: claim.order_id ?? null,
+      total_cents: Math.round(Number((data?.[0] as any)?.total ?? 0)),
+      change_cents: 0,
+      replayed,
+      cart_id: claim.cart_id,
+      status: 'awaiting_payment',
+      checkout_url: (claim.metadata as any)?.checkout_url ?? null,
+    },
+  }
+}
+
 /**
  * Record one counter sale exactly once. `sale` must already be validated by
  * `validateInPersonSale`; `now` is injectable for the stale-claim boundary.
@@ -314,10 +338,6 @@ export async function recordInPersonSale(
 ): Promise<RecordResult> {
   // S1 ships cash; card (S2.1) and transfer (S2.2) are refused BEFORE any claim, so
   // a client that sends them early leaves nothing behind to clean up.
-  if (sale.kind !== 'cash') {
-    return refuse(422, 'KIND_NOT_AVAILABLE', 'Este método de cobro todavía no está disponible en el mostrador.')
-  }
-
   // ── validate: the seller may transact, in MX, with its own variants ──────────
   const sellerService = scope.resolve(SELLER_MODULE)
   const [seller] = await sellerService.listSellers({ id: sellerId })
@@ -376,6 +396,8 @@ export async function recordInPersonSale(
           },
         }
       }
+      case 'awaiting':
+        return awaitingResult(scope, existing, 200, true)
       case 'reject_reused':
         return refuse(409, 'CLIENT_ID_REUSED', 'Este identificador ya se usó para otra venta.')
       case 'reject_closed':
@@ -412,7 +434,8 @@ export async function recordInPersonSale(
           metadata: {
             source: 'in_person',
             seller_id: sellerId,
-            payment_method: 'cash',
+            // Card/transfer: start-checkout overwrites this with the provider it opens.
+            payment_method: sale.kind === 'cash' ? 'cash' : 'pending',
             fulfillment_method: 'in_person',
             in_person: {
               client_id: sale.client_id,
@@ -433,6 +456,15 @@ export async function recordInPersonSale(
         return refuse(409, 'IN_PROGRESS', 'La venta se está registrando. Intenta en un momento.')
       }
       cartId = builtCartId
+    }
+
+    if (sale.kind !== 'cash') {
+      // D9/D10: card and transfer stop here — the cart is the sale; the shop's own
+      // checkout (start-checkout) takes the payment and the webhook / «Ya me llegó»
+      // completes it. `awaiting_payment` is settled: a resend returns this same cart.
+      await inPerson.updateInPersonSales({ id: claimId, status: 'awaiting_payment' })
+      const [row] = await inPerson.listInPersonSales({ id: claimId })
+      return awaitingResult(scope, row, existingCartId ? 200 : 201, Boolean(existingCartId))
     }
 
     // D4: `replayed` means THIS call did not create the order — the cart had already

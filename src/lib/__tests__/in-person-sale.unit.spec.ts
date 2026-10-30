@@ -144,6 +144,15 @@ describe('decideExistingClaim', () => {
       .toEqual({ action: 'takeover', cart_id: 'cart_1' })
   })
 
+  it('a card/transfer sale waiting for payment hands back its SAME cart, even when old', () => {
+    const waiting = claim({ status: 'awaiting_payment', claimed_at: new Date(0) })
+    expect(decideExistingClaim(waiting, 'h1', now)).toEqual({ action: 'awaiting', cart_id: 'cart_1' })
+  })
+
+  it('a waiting sale under a reused client_id with a different sale is still refused', () => {
+    expect(decideExistingClaim(claim({ status: 'awaiting_payment' }), 'h2', now)).toEqual({ action: 'reject_reused' })
+  })
+
   it('cancelled and failed claims are closed, never re-applied', () => {
     expect(decideExistingClaim(claim({ status: 'failed' }), 'h1', now)).toEqual({ action: 'reject_closed', status: 'failed' })
     expect(decideExistingClaim(claim({ status: 'cancelled' }), 'h1', now)).toEqual({ action: 'reject_closed', status: 'cancelled' })

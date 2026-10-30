@@ -64,6 +64,11 @@ const SHIPPING_METHOD_LABEL: Record<string, string> = {
 
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://miyagisanchez.com'
 
+// D8 (in-person-sales): a counter QR checkout expires after ~30 minutes. Stripe refuses
+// an `expires_at` under 30 minutes from when IT receives the request, so exactly 30
+// would fail on network latency — 31. Mercado Pago uses the same value so both match.
+const COUNTER_CHECKOUT_TTL_MS = 31 * 60 * 1000
+
 // Escrow: 3-day auto-confirm window (buyer must confirm delivery; else auto-captured)
 const ESCROW_AUTO_CAPTURE_DAYS = 3
 
@@ -341,6 +346,24 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     return res.status(400).json({ message: 'Cart is empty' })
   }
 
+  // ── Server-built carts (in-person-sales D8) ───────────────────────────────
+  // A counter sale (`in_person`) or a payment link (`payment_link`) is a cart OUR
+  // server routes built and priced. The source is read from the CART's metadata —
+  // never the body — because only those routes write it. For such a cart the cart
+  // total IS the price: no client offer amount, coupon or bundle can move it.
+  const cartMeta = ((cart as any).metadata ?? {}) as Record<string, unknown>
+  const serverCartSource: 'in_person' | 'payment_link' | null =
+    cartMeta.source === 'in_person' || cartMeta.source === 'payment_link' ? cartMeta.source : null
+  const isCounterCart = serverCartSource === 'in_person'
+  const paymentLinkId = serverCartSource === 'payment_link' && typeof cartMeta.payment_link_id === 'string'
+    ? cartMeta.payment_link_id
+    : null
+  if (serverCartSource) {
+    body.offer_amount_cents = undefined
+    body.offer_id = undefined
+    body.coupon_code = undefined
+  }
+
   const item = cart.items[0] as any
   const productId = item.product_id ?? item.variant?.product_id
 
@@ -385,7 +408,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       const isDigitalItem = listingType === 'digital' || listingType === 'print_ad'
       return isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem })
     })
-    if (cartHasCoordinatedItem && !isManual) {
+    // A counter sale hands the goods over in person, so "delivery is coordinated" has
+    // nothing left to coordinate — card by QR is exactly the point (D8).
+    if (cartHasCoordinatedItem && !isManual && !isCounterCart) {
       return res.status(422).json({ message: COORD_MESSAGE })
     }
   }
@@ -537,7 +562,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // offer override (offer_amount_cents already reflects an agreed price).
   const bundleSettings = (sellerSettings.bundles ?? null) as BundleSettings | null
   const itemCount = (cart.items ?? []).length
-  const bundleTier = body.offer_amount_cents || supportCheckout || rentalBooking ? null : resolveBundleTier(bundleSettings, itemCount)
+  const bundleTier = body.offer_amount_cents || supportCheckout || rentalBooking || serverCartSource ? null : resolveBundleTier(bundleSettings, itemCount)
   const bundleDiscountCents = bundleTier
     ? Math.round(itemsTotalCents * bundleTier.percent_off / 100)
     : 0
@@ -738,8 +763,14 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     console.error('[start-checkout] addShippingMethods failed:', e)
   }
 
-  const successUrl = `${SITE_URL}/payment/success?cart_id=${cartId}`
-  const cancelUrl = supportCheckout
+  // D8: a counter or link buyer lands on a neutral thank-you page; the webhook (and the
+  // reconcile cron) completes the cart, never this redirect.
+  const successUrl = serverCartSource
+    ? `${SITE_URL}/pago/listo?cart_id=${cartId}`
+    : `${SITE_URL}/payment/success?cart_id=${cartId}`
+  const cancelUrl = serverCartSource
+    ? `${SITE_URL}/pago/listo?cart_id=${cartId}&estado=cancelado`
+    : supportCheckout
     ? `${SITE_URL}/s/${seller.slug}?payment=cancelled`
     : `${SITE_URL}/l/${productId ?? cartId}?payment=cancelled`
   const paymentProductTitle = supportCheckout ? `Apoyo para ${seller.name}` : productTitle
@@ -835,6 +866,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
     const session = await stripeClient.checkout.sessions.create({
       mode: 'payment',
+      // D8: just over Stripe's 30-minute minimum (see COUNTER_CHECKOUT_TTL_MS).
+      ...(isCounterCart ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) } : {}),
       line_items: lineItems,
       // MX: transfer_data + application_fee_amount (destination charge, platform context).
       // US: empty — a direct charge carries no transfer and no application fee; the
@@ -852,6 +885,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         product_id: productId ?? '',
         seller_id: seller?.id ?? '',
         payment_method: 'stripe',
+        ...(serverCartSource ? { source: serverCartSource } : {}),
+        ...(paymentLinkId ? { payment_link_id: paymentLinkId } : {}),
         fulfillment_method: fulfillmentMethod,
         // Webhook routing context (D15). A direct-charge event must arrive with
         // `event.account` equal to this account; a destination-charge event must
@@ -963,11 +998,19 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         pending: successUrl,
       },
       auto_return: 'approved',
+      // D8: a counter QR is paid within minutes or not at all; an expired preference
+      // cannot be paid after the merchant has walked away from the sale.
+      ...(isCounterCart ? {
+        expires: true,
+        expiration_date_to: new Date(Date.now() + COUNTER_CHECKOUT_TTL_MS).toISOString(),
+      } : {}),
       metadata: {
         cart_id: cartId,
         product_id: productId ?? '',
         seller_id: seller?.id ?? '',
         payment_method: 'mercadopago',
+        ...(serverCartSource ? { source: serverCartSource } : {}),
+        ...(paymentLinkId ? { payment_link_id: paymentLinkId } : {}),
         fulfillment_method: fulfillmentMethod,
         ...(supportMetadata ? {
           checkout_kind: 'support',
