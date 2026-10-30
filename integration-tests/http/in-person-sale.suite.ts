@@ -323,6 +323,32 @@ export function inPersonSaleSuite(getContainer: () => any) {
         expect(cancel.ok && cancel.status.state).toBe('unverified')
       })
 
+      it('a cancel never wins while a checkout is being opened, and a cancelled sale cannot start one (codex, PR 218)', async () => {
+        const container = getContainer()
+        const knex: any = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+        const s = sale({ kind: 'card', tendered_cents: null })
+        const r = await recordInPersonSale(container as any, sellerId, s)
+        if (!r.ok) throw new Error(r.code)
+        // start-checkout's opening write (same SQL condition) has just won: no session yet.
+        await knex.raw(
+          `update in_person_sale set metadata = coalesce(metadata,'{}'::jsonb) || jsonb_build_object('checkout_started_at', now())
+            where cart_id = ? and status = 'awaiting_payment'`, [r.body.cart_id])
+        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
+        expect(!cancel.ok && cancel.code).toBe('IN_PROGRESS')
+
+        // A fresh sale cancelled first: start-checkout's opening condition can no longer match.
+        const s2 = sale({ kind: 'card', tendered_cents: null })
+        const r2 = await recordInPersonSale(container as any, sellerId, s2)
+        if (!r2.ok) throw new Error(r2.code)
+        const c2 = await cancelInPersonSale(container as any, sellerId, s2.client_id)
+        expect(c2.ok && c2.status.state).toBe('cancelled')
+        const open = await knex.raw(
+          `update in_person_sale set metadata = coalesce(metadata,'{}'::jsonb) || jsonb_build_object('checkout_started_at', now())
+            where cart_id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null returning id`,
+          [r2.body.cart_id])
+        expect(open.rows).toHaveLength(0)
+      })
+
       it('an unpaid card sale cancels, and a cancelled sale cannot be resent', async () => {
         const container = getContainer()
         const s = sale({ kind: 'card', tendered_cents: null })

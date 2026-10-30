@@ -168,27 +168,53 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
     return { ok: false, status: 409, code: 'CASH_NOT_CANCELLABLE', message: 'Una venta en efectivo ya está registrada.' }
   }
 
+  if (claim.status === 'claimed') {
+    // The cart is still being built: nothing is payable yet, but answering "cancelled"
+    // now would be a lie the moment the build finishes (codex, PR 218). Retry shortly.
+    return { ok: false, status: 409, code: 'IN_PROGRESS', message: 'La venta se está preparando. Intenta en un momento.' }
+  }
   if (claim.cart_id && !(await orderForCart(scope, claim.cart_id)) && claim.status === 'awaiting_payment') {
-    const { session } = await cartCheckout(scope, claim.cart_id)
-    if (session) {
-      try {
-        await expireProviderCheckout(scope, sellerId, { ...session, cart_id: claim.cart_id })
-      } catch (e) {
-        if (e instanceof PaymentInFlight) {
-          return { ok: false, status: 409, code: 'PAYMENT_IN_PROGRESS', message: 'El comprador ya está pagando. Espera unos segundos.' }
-        }
-        // Refuse to close a sale whose QR may still be payable: the merchant would
-        // believe it cancelled while the buyer can still pay. Say so; they retry.
-        console.error('[in-person] provider checkout expiry failed', { clientId, message: (e as Error)?.message })
-        return { ok: false, status: 502, code: 'CANCEL_FAILED', message: 'No pudimos cancelar el cobro. Intenta otra vez.' }
-      }
-    }
     const knex = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
-    await knex.raw(
-      `update in_person_sale set status = 'cancelled', updated_at = now()
-        where id = ? and status = 'awaiting_payment'`,
-      [claim.id],
-    )
+    const startedAt = (claim.metadata as any)?.checkout_started_at as string | undefined
+    if (!startedAt) {
+      // No checkout was ever started: close the sale only if that is STILL true —
+      // the same condition start-checkout's opening write requires, so exactly one wins.
+      const r = await knex.raw(
+        `update in_person_sale set status = 'cancelled', updated_at = now()
+          where id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null
+          returning id`,
+        [claim.id],
+      )
+      if (!(r?.rows?.length)) {
+        return { ok: false, status: 409, code: 'IN_PROGRESS', message: 'El cobro se está abriendo. Intenta en un momento.' }
+      }
+    } else {
+      const { session } = await cartCheckout(scope, claim.cart_id)
+      if (!session) {
+        // Started but not yet linked: the QR is being created right now. Only a start
+        // that clearly died (no session after CHECKOUT_OPEN_STALE_MS) may be closed.
+        if (Date.now() - new Date(startedAt).getTime() < CHECKOUT_OPEN_STALE_MS) {
+          return { ok: false, status: 409, code: 'IN_PROGRESS', message: 'El cobro se está abriendo. Intenta en un momento.' }
+        }
+      } else {
+        try {
+          await expireProviderCheckout(scope, sellerId, { ...session, cart_id: claim.cart_id })
+        } catch (e) {
+          if (e instanceof PaymentInFlight) {
+            return { ok: false, status: 409, code: 'PAYMENT_IN_PROGRESS', message: 'El comprador ya está pagando. Espera unos segundos.' }
+          }
+          // Refuse to close a sale whose QR may still be payable: the merchant would
+          // believe it cancelled while the buyer can still pay. Say so; they retry.
+          console.error('[in-person] provider checkout expiry failed', { clientId, message: (e as Error)?.message })
+          return { ok: false, status: 502, code: 'CANCEL_FAILED', message: 'No pudimos cancelar el cobro. Intenta otra vez.' }
+        }
+      }
+      await knex.raw(
+        `update in_person_sale set status = 'cancelled', updated_at = now()
+          where id = ? and status = 'awaiting_payment'`,
+        [claim.id],
+      )
+    }
   }
 
   const status = await getInPersonSaleStatus(scope, sellerId, clientId)
@@ -196,6 +222,12 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
 }
 
 class PaymentInFlight extends Error {}
+
+/**
+ * A checkout start that left no payment session after this long died (start-checkout
+ * creates and links its session within one request; the proxy times out at 25 s).
+ */
+const CHECKOUT_OPEN_STALE_MS = 2 * 60 * 1000
 
 async function expireProviderCheckout(
   scope: Scope,

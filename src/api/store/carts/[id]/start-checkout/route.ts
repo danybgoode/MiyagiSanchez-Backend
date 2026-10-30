@@ -231,6 +231,20 @@ async function serverBuiltCart(
   return claim ? { status: String(claim.status) } : null
 }
 
+/** Take the one right to open this counter cart's checkout. True only for the winner. */
+async function openCounterCheckout(req: MedusaRequest, cartId: string): Promise<boolean> {
+  const knex: any = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  const r = await knex.raw(
+    `update in_person_sale
+        set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_started_at', now()),
+            updated_at = now()
+      where cart_id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null
+      returning id`,
+    [cartId],
+  )
+  return (r?.rows?.length ?? 0) > 0
+}
+
 /** Does this cart already carry a payment collection (i.e. a checkout was opened)? */
 async function cartHasPaymentCollection(req: MedusaRequest, cartId: string): Promise<boolean> {
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
@@ -388,8 +402,16 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // for payment: a cancelled sale must not become payable again, and a second call
     // would link a second collection whose session cancel could never expire
     // (verifier + codex, PR 218). The status route reads the one checkout URL back.
-    if (serverClaim!.status !== 'awaiting_payment') {
-      return res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
+    //
+    // Atomic: the right to open the checkout is a conditional write on the claim
+    // (`checkout_started_at` set only while the sale awaits payment and none was
+    // started). Cancel takes the same row with the opposite condition, so a cancel and
+    // a checkout racing for one sale cannot both win — a check-then-act here let a
+    // cancel land between the check and the provider session (codex, PR 218).
+    if (!(await openCounterCheckout(req, cartId))) {
+      return serverClaim!.status !== 'awaiting_payment'
+        ? res.status(409).json({ code: 'SALE_CLOSED', message: 'Esta venta ya no se puede cobrar.' })
+        : res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
     }
     if (await cartHasPaymentCollection(req, cartId)) {
       return res.status(409).json({ code: 'CHECKOUT_EXISTS', message: 'Este cobro ya tiene un pago abierto.' })
