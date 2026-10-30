@@ -158,3 +158,22 @@ describe('decideExistingClaim', () => {
     expect(decideExistingClaim(claim({ status: 'cancelled' }), 'h1', now)).toEqual({ action: 'reject_closed', status: 'cancelled' })
   })
 })
+
+describe('disallowedCounterProviders (codex security lens, PR 218)', () => {
+  const { disallowedCounterProviders } = require('../in-person-sale')
+  it('a card sale may complete only on a card processor', () => {
+    expect(disallowedCounterProviders('card', ['pp_stripe-connect_stripe-connect'])).toEqual([])
+    expect(disallowedCounterProviders('card', ['pp_mercadopago_mercadopago'])).toEqual([])
+    expect(disallowedCounterProviders('card', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
+    expect(disallowedCounterProviders('card', ['pp_manual_manual'])).toEqual(['pp_manual_manual'])
+  })
+  it('cash only on cash, transfer only on the manual provider', () => {
+    expect(disallowedCounterProviders('cash', ['pp_cash_cash'])).toEqual([])
+    expect(disallowedCounterProviders('cash', ['pp_stripe-connect_stripe-connect'])).toEqual(['pp_stripe-connect_stripe-connect'])
+    expect(disallowedCounterProviders('transfer', ['pp_manual_manual'])).toEqual([])
+    expect(disallowedCounterProviders('transfer', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
+  })
+  it('an unknown kind allows nothing', () => {
+    expect(disallowedCounterProviders('barter', ['pp_cash_cash'])).toEqual(['pp_cash_cash'])
+  })
+})

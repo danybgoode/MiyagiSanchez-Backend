@@ -168,6 +168,12 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
     return { ok: false, status: 409, code: 'CASH_NOT_CANCELLABLE', message: 'Una venta en efectivo ya está registrada.' }
   }
 
+  if (claim.cart_id && claim.kind === 'transfer' && (claim.order_id || (await orderForCart(scope, claim.cart_id)))) {
+    // A transfer's cart becomes a PENDING order as soon as the CLABE is shown; that order
+    // is cancelled from Pedidos like any other, never silently "cancelled" here while it
+    // stays pending (codex, PR 218).
+    return { ok: false, status: 409, code: 'TRANSFER_ORDER_EXISTS', message: 'Esta transferencia ya es un pedido. Cancélalo desde Pedidos.' }
+  }
   if (claim.status === 'claimed') {
     // The cart is still being built: nothing is payable yet, but answering "cancelled"
     // now would be a lie the moment the build finishes (codex, PR 218). Retry shortly.
@@ -196,6 +202,19 @@ export async function cancelInPersonSale(scope: Scope, sellerId: string, clientI
         if (Date.now() - new Date(startedAt).getTime() < CHECKOUT_OPEN_STALE_MS) {
           return { ok: false, status: 409, code: 'IN_PROGRESS', message: 'El cobro se está abriendo. Intenta en un momento.' }
         }
+        // The start died. Close ONLY if nobody re-opened it since we read it: start-checkout
+        // re-opens a dead start with the same compare-and-set on checkout_started_at.
+        const r = await knex.raw(
+          `update in_person_sale set status = 'cancelled', updated_at = now()
+            where id = ? and status = 'awaiting_payment' and metadata->>'checkout_started_at' = ?
+            returning id`,
+          [claim.id, startedAt],
+        )
+        if (!(r?.rows?.length)) {
+          return { ok: false, status: 409, code: 'IN_PROGRESS', message: 'El cobro se está abriendo. Intenta en un momento.' }
+        }
+        const status = await getInPersonSaleStatus(scope, sellerId, clientId)
+        return { ok: true, status: status! }
       } else {
         try {
           await expireProviderCheckout(scope, sellerId, { ...session, cart_id: claim.cart_id })
@@ -227,7 +246,7 @@ class PaymentInFlight extends Error {}
  * A checkout start that left no payment session after this long died (start-checkout
  * creates and links its session within one request; the proxy times out at 25 s).
  */
-const CHECKOUT_OPEN_STALE_MS = 2 * 60 * 1000
+export const CHECKOUT_OPEN_STALE_MS = 2 * 60 * 1000
 
 async function expireProviderCheckout(
   scope: Scope,
@@ -241,11 +260,13 @@ async function expireProviderCheckout(
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-09-30.clover' as any })
     // Direct charges (US) live on the seller's account; MX destination charges on ours.
     const opts = ctx?.stripe_strategy === 'direct_charge' ? { stripeAccount: ctx.stripe_account_id } : undefined
-    const current = await stripe.checkout.sessions.retrieve(sessionId, opts)
+    // Request options are the THIRD argument (the second is params) — passing the
+    // connected account second silently targets the platform account (codex, PR 218).
+    const current = await stripe.checkout.sessions.retrieve(sessionId, {}, opts)
     // `complete` = the buyer paid and the webhook has not landed yet: cancelling now
     // would tell the merchant "cancelled" moments before the sale turns paid.
     if (current.status === 'complete') throw new PaymentInFlight()
-    if (current.status === 'open') await stripe.checkout.sessions.expire(sessionId, opts)
+    if (current.status === 'open') await stripe.checkout.sessions.expire(sessionId, {}, opts)
     return
   }
   if (session.provider_id === 'pp_mercadopago_mercadopago') {

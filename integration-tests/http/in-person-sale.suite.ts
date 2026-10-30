@@ -274,7 +274,7 @@ export function inPersonSaleSuite(getContainer: () => any) {
 
       // ── S2 · card and transfer (D9/D10) ─────────────────────────────────────
       // Completes the cart on the cash provider — exactly what the session-swap exploit
-      // does, which is why the card case below must NOT read it as paid.
+      // does, which is why the card case below must be REFUSED.
       async function payCart(container: any, cartId: string) {
         await container.resolve(Modules.CART).addShippingMethods(cartId, [{
           name: 'Entregado en persona', amount: 0, shipping_option_id: (await container.resolve(Modules.FULFILLMENT).listShippingOptions({}))[0].id, data: {},
@@ -306,21 +306,22 @@ export function inPersonSaleSuite(getContainer: () => any) {
         expect(await getInPersonSaleStatus(container as any, otherSellerId, s.client_id)).toBeNull()
       })
 
-      it('a card cart completed on the CASH provider is never reported paid (verifier, PR 218)', async () => {
+      it('a card cart CANNOT be completed on the cash provider — no order, no stock (codex security lens, PR 218)', async () => {
         // The session-swap exploit: anyone holding the cart id can switch its session to
-        // pp_cash_cash (region-enabled) and complete it. An order exists; no money moved.
-        // Card "paid" is reserved for the processor-confirmed providers (unit-pinned).
+        // pp_cash_cash (region-enabled) and complete it. The completeCart validate hook
+        // refuses before an order exists.
         const container = getContainer()
+        const before = await getProductAvailableQuantity(container as any, productId)
         const s = sale({ kind: 'card', tendered_cents: null })
         const r = await recordInPersonSale(container as any, sellerId, s)
         if (!r.ok) throw new Error(r.code)
-        await payCart(container, r.body.cart_id!)
+        let refused: string | null = null
+        try { await payCart(container, r.body.cart_id!) } catch (e) { refused = String((e as Error).message) }
+        expect(refused).toMatch(/cannot be completed with pp_cash_cash/)
         const status = await getInPersonSaleStatus(container as any, sellerId, s.client_id)
-        expect(status?.state).toBe('unverified')
-        expect(status?.order_id).toBeTruthy()
-        // And a cancel after that cannot turn the existing order into "cancelled".
-        const cancel = await cancelInPersonSale(container as any, sellerId, s.client_id)
-        expect(cancel.ok && cancel.status.state).toBe('unverified')
+        expect(status?.state).toBe('awaiting_payment')
+        expect(status?.order_id).toBeNull()
+        expect(await getProductAvailableQuantity(container as any, productId)).toBe(before)
       })
 
       it('a cancel never wins while a checkout is being opened, and a cancelled sale cannot start one (codex, PR 218)', async () => {

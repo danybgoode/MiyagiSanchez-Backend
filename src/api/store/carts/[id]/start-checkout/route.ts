@@ -19,6 +19,7 @@ import { Modules, ContainerRegistrationKeys } from '@medusajs/framework/utils'
 import { ICartModuleService, IPaymentModuleService, IPromotionModuleService } from '@medusajs/framework/types'
 import { SELLER_MODULE } from '../../../../../modules/seller'
 import { IN_PERSON_MODULE } from '../../../../../modules/in-person'
+import { CHECKOUT_OPEN_STALE_MS } from '../../../../../lib/in-person-sale-status'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
@@ -234,15 +235,32 @@ async function serverBuiltCart(
 /** Take the one right to open this counter cart's checkout. True only for the winner. */
 async function openCounterCheckout(req: MedusaRequest, cartId: string): Promise<boolean> {
   const knex: any = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  const mark = `metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_started_at', now()::text)`
   const r = await knex.raw(
-    `update in_person_sale
-        set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('checkout_started_at', now()),
-            updated_at = now()
+    `update in_person_sale set ${mark}, updated_at = now()
       where cart_id = ? and status = 'awaiting_payment' and (metadata->>'checkout_started_at') is null
       returning id`,
     [cartId],
   )
-  return (r?.rows?.length ?? 0) > 0
+  if ((r?.rows?.length ?? 0) > 0) return true
+  // A start that died before creating its payment session (a provider error, a crash)
+  // must not wedge the sale forever (codex, PR 218): re-open it once it is stale and
+  // still has no collection — compare-and-set on the exact mark we read, the same
+  // condition cancel uses, so a re-open and a cancel cannot both win.
+  const [row] = (await knex.raw(
+    `select metadata->>'checkout_started_at' as started from in_person_sale where cart_id = ? and status = 'awaiting_payment'`,
+    [cartId],
+  ))?.rows ?? []
+  const started: string | undefined = row?.started
+  if (!started || Date.now() - new Date(started).getTime() < CHECKOUT_OPEN_STALE_MS) return false
+  if (await cartHasPaymentCollection(req, cartId)) return false
+  const re = await knex.raw(
+    `update in_person_sale set ${mark}, updated_at = now()
+      where cart_id = ? and status = 'awaiting_payment' and metadata->>'checkout_started_at' = ?
+      returning id`,
+    [cartId, started],
+  )
+  return (re?.rows?.length ?? 0) > 0
 }
 
 /** Does this cart already carry a payment collection (i.e. a checkout was opened)? */

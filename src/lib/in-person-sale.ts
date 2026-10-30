@@ -183,3 +183,23 @@ export function decideExistingClaim(existing: ExistingClaim, payloadHash: string
   if (Number.isFinite(claimedAt) && now.getTime() - claimedAt < CLAIM_STALE_MS) return { action: 'in_progress' }
   return { action: 'takeover', cart_id: existing.cart_id }
 }
+
+/**
+ * Which payment providers may complete a counter cart of each kind (in-person-sales
+ * D5/D9/D10). Enforced in `completeCartWorkflow`'s validate hook, BEFORE the order
+ * exists: a buyer holding a card sale's cart id can switch its session to the cash
+ * provider through the public payment-session route and complete it — an order with
+ * no money behind it, stock reserved and revenue booked (codex security lens, PR 218).
+ */
+export const COUNTER_ALLOWED_PROVIDERS: Readonly<Record<InPersonSaleKind, ReadonlySet<string>>> = {
+  cash: new Set(['pp_cash_cash']),
+  card: new Set(['pp_stripe-connect_stripe-connect', 'pp_mercadopago_mercadopago']),
+  transfer: new Set(['pp_manual_manual']),
+}
+
+/** The providers among `providerIds` a counter cart of `kind` may NOT complete on. */
+export function disallowedCounterProviders(kind: string, providerIds: string[]): string[] {
+  const allowed = COUNTER_ALLOWED_PROVIDERS[kind as InPersonSaleKind]
+  if (!allowed) return [...providerIds]
+  return providerIds.filter((id) => !allowed.has(id))
+}
