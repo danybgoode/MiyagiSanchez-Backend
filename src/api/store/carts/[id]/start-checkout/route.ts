@@ -1257,6 +1257,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     }
   }
   let counterMark: string | null = null
+  let counterLinkedCollectionId: string | null = null
   if (isCounterCart) {
     counterMark = await openCounterCheckout(req, cartId)
     if (!counterMark) {
@@ -1325,6 +1326,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       [Modules.CART]: { cart_id: cartId },
       [Modules.PAYMENT]: { payment_collection_id: paymentCollection.id },
     })
+    counterLinkedCollectionId = isCounterCart ? paymentCollection.id : null
 
     const responseBody: Record<string, unknown> = {
       redirect_url: redirectUrl,
@@ -1373,6 +1375,14 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     console.error('[start-checkout] Medusa payment session error:', e)
     if (isCounterCart && counterMark) {
       await expireCreated()
+      // Unlink a collection this failed attempt attached, or the next attempt would be
+      // refused as CHECKOUT_EXISTS forever (codex, PR 218).
+      if (counterLinkedCollectionId) {
+        await req.scope.resolve(ContainerRegistrationKeys.LINK).dismiss({
+          [Modules.CART]: { cart_id: cartId },
+          [Modules.PAYMENT]: { payment_collection_id: counterLinkedCollectionId },
+        }).catch((err: unknown) => console.error('[start-checkout] could not unlink a failed counter collection', err))
+      }
       await releaseCounterCheckout(req, cartId, counterMark).catch(() => {})
     }
     // Fail loudly: without a Medusa PaymentSession the cart can never be

@@ -29,6 +29,17 @@ completeCartWorkflow.hooks.validate(async ({ cart }, { container }) => {
   if ((claim.status === 'cancelled' || claim.status === 'failed') && claim.kind !== 'card') {
     throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This counter sale was closed.')
   }
+  if (claim.status === 'cancelled' || claim.status === 'failed') {
+    // A closed CARD sale may still become its order only through the checkout the
+    // server recorded before the close (a payment made seconds before the cancel). Any
+    // other session — opened through the public payment-session route after the
+    // cancel — is refused (codex, PR 218).
+    const ref = (claim.metadata as any)?.checkout_ref
+    const viaRecorded = (((cart as any)?.payment_collection?.payment_sessions ?? []) as Array<{ status?: string; data?: any }>)
+      .filter((s) => PROCESSABLE.has(String(s?.status)))
+      .every((s) => ref && (s?.data?.stripe_session_id === ref || s?.data?.mp_preference_id === ref))
+    if (!viaRecorded) throw new MedusaError(MedusaError.Types.NOT_ALLOWED, 'This counter sale was closed.')
+  }
   const sessions = (((cart as any)?.payment_collection?.payment_sessions ?? []) as Array<{ provider_id?: string; status?: string }>)
     .filter((s) => PROCESSABLE.has(String(s?.status)))
     .map((s) => String(s?.provider_id))

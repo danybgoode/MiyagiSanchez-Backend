@@ -9,7 +9,7 @@
  * Money taken is never hidden: if the buyer pays in the seconds after the merchant
  * cancelled, the cart still became a paid order, and the status reports `paid`.
  */
-import { ContainerRegistrationKeys } from '@medusajs/framework/utils'
+import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
 import Stripe from 'stripe'
 import { IN_PERSON_MODULE } from '../modules/in-person'
 import { SELLER_MODULE } from '../modules/seller'
@@ -161,7 +161,20 @@ export type CancelResult =
  * provider checkout is expired FIRST (so the QR can no longer be paid), then the claim
  * is closed — conditionally, so a cancel never overwrites a sale the webhook settled.
  */
+/**
+ * Cancel holds the SAME lock `completeCartWorkflow` takes (key = cart id, core-flows
+ * acquireLockStep), so a cancel and a buyer's in-flight completion of the same cart run
+ * one after the other: either the order exists when cancel looks (and cancel reports it),
+ * or the completion's hook sees the closed sale (codex security lens, PR 218).
+ */
 export async function cancelInPersonSale(scope: Scope, sellerId: string, clientId: string): Promise<CancelResult> {
+  const claim = await loadClaim(scope, sellerId, clientId)
+  if (!claim?.cart_id) return cancelInPersonSaleUnlocked(scope, sellerId, clientId)
+  const locking = scope.resolve(Modules.LOCKING)
+  return locking.execute(claim.cart_id, () => cancelInPersonSaleUnlocked(scope, sellerId, clientId), { timeout: 30 })
+}
+
+async function cancelInPersonSaleUnlocked(scope: Scope, sellerId: string, clientId: string): Promise<CancelResult> {
   const claim = await loadClaim(scope, sellerId, clientId)
   if (!claim) return { ok: false, status: 404, code: 'SALE_NOT_FOUND', message: 'No encontramos esa venta.' }
   if (claim.kind === 'cash') {
