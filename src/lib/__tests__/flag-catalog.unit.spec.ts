@@ -106,7 +106,9 @@ describe('Medusa flag inventory', () => {
     // catalog.owned_shop_only_enabled — seller-product-create.ts (S3.1's null
     // acceptance) and seller-product-update.ts (S3.2's publish/unpublish, both
     // directions) — both registered in flag-catalog.ts's owners array above.
-    expect(callsites).toHaveLength(35)
+    // business-infrastructure D12: +1 on ops.profit_enabled — the internal ledger read for the monthly check-in
+    // (src/api/internal/profit/ledger/route.ts), registered in the same owners array.
+    expect(callsites).toHaveLength(36)
     const validation = validateBackendFlagCallsiteInventory(callsites)
     expect(validation).toEqual({ ok: true })
   })

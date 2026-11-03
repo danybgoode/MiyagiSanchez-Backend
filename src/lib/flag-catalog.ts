@@ -148,6 +148,7 @@ const FLAG_CATALOG_DEFINITIONS = {
     owners: [
       'src/api/internal/profit/apply-price/route.ts',
       'src/api/internal/profit/backfill/route.ts',
+      'src/api/internal/profit/ledger/route.ts',
       'src/api/store/sellers/me/products/bulk-stage/route.ts',
       'src/api/store/sellers/me/profit/apply-price/route.ts',
       'src/api/store/sellers/me/profit/fee-estimate/route.ts',
