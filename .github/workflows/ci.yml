@@ -1,7 +1,7 @@
 name: CI
 
 # Deterministic pre-merge gate for the backend (Roadmap/WAYS-OF-WORKING.md → Review & merge).
-# Mirrors the frontend's `typecheck-build` job (apps/miyagisanchez/.github/workflows/ci.yml),
+# Mirrors the frontend's `typecheck-build` job (apps/storefront/.github/workflows/ci.yml),
 # adapted for Medusa:
 #
 #   build      — `medusa build` FIRST: it generates `.medusa/types/*` (the link/module

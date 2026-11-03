@@ -216,7 +216,7 @@ export function resolveStockLocationForMarket(value: unknown, env: MarketMedusaE
  * shape is only safe where every unresolved state means "cannot proceed".
  *
  * NOTE for this repo specifically: `MEDUSA_MXN_REGION_ID` is a FRONTEND env var
- * today (`apps/miyagisanchez/lib/medusa.ts`); the backend resolves its Region from
+ * today (`apps/storefront/lib/medusa.ts`); the backend resolves its Region from
  * the database, so this function usually answers `unconfigured` here. That is
  * correct and harmless — no backend caller uses the id for commerce. It exists so
  * the destructive setup guard (D6) can protect a registry-addressable Region when

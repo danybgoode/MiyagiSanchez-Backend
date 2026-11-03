@@ -33,7 +33,7 @@
  * key means nobody can check out at all.)
  *
  * The storefront never sends `sales_channel_id` — there is no call site in
- * `apps/miyagisanchez` — so there is no code path that avoids step 2. A single-channel
+ * `apps/storefront` — so there is no code path that avoids step 2. A single-channel
  * key makes the failure unrepresentable rather than merely unlikely.
  *
  * ── ROLLBACK (epic README, D9) ─────────────────────────────────────────────────

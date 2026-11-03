@@ -1,7 +1,7 @@
 /**
  * Pure quantity price-tier validation for seller-defined variant pricing
  * (custom-print-products Sprint 2). Mirrors the discipline of
- * `apps/miyagisanchez/lib/personalization.ts`: pure, never throws, returns a
+ * `apps/storefront/lib/personalization.ts`: pure, never throws, returns a
  * structured result.
  *
  * A tier ladder must cover [1, ∞) with no overlap and no gap: sorted by

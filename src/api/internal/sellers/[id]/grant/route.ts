@@ -60,7 +60,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   if (!seller) return res.status(404).json({ message: 'Seller not found' })
 
   // Read-modify-write the whole metadata blob (established pattern — see
-  // apps/miyagisanchez app/api/admin/tenants/[id]/route.ts for the sibling
+  // apps/storefront app/api/admin/tenants/[id]/route.ts for the sibling
   // Supabase-side precedent this mirrors).
   const metadata: Record<string, unknown> = { ...(seller.metadata ?? {}) }
   if (body.action === 'grant') {
