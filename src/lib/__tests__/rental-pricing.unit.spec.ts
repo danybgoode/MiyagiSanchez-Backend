@@ -15,7 +15,7 @@ import {
  *
  * The charged rental total MUST be exact (S1.2 bills what these functions return),
  * so the math is a pure seam proven here. Ported 1:1 from the frontend's
- * `apps/miyagisanchez/e2e/rental-pricing.spec.ts`, PLUS the backend-only
+ * `apps/storefront/e2e/rental-pricing.spec.ts`, PLUS the backend-only
  * `readDepositCents` pesos→cents normalization.
  */
 

@@ -1,7 +1,7 @@
 /**
  * Envia.com API client — backend copy.
  *
- * Mirrors apps/miyagisanchez/lib/envia.ts but lives in the Medusa backend
+ * Mirrors apps/storefront/lib/envia.ts but lives in the Medusa backend
  * so all Envia calls originate server-side from one place.
  *
  * Auth:  ENVIA_API_KEY env var (Bearer token)

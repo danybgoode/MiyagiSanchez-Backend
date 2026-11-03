@@ -4,7 +4,7 @@
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * THIS FILE IS DUPLICATED, BYTE-FOR-BYTE, IN TWO REPOSITORIES:
- *   · apps/miyagisanchez/lib/markets.ts       (frontend)
+ *   · apps/storefront/lib/markets.ts       (frontend)
  *   · apps/backend/src/lib/markets.ts         (backend)
  * They have no shared package and different build systems, so the contract is
  * kept honest by a GOLDEN SPEC in each repo that asserts every field of every

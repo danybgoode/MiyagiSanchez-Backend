@@ -7,7 +7,7 @@
 
 **Medusa v2** — the commerce engine behind miyagisanchez.com, a multi-seller P2P marketplace for
 Mexico. It owns products, carts, checkout, orders, payments, fulfillment, inventory and regions. The
-Next.js storefront (`apps/miyagisanchez`, a **separate repo**) is a client of this.
+Next.js storefront (`apps/storefront`, a **separate repo**) is a client of this.
 
 ```
 src/
@@ -31,7 +31,7 @@ Say that split in every PR: the agent owns API-level prod smoke, Daniel owns the
 - **`Roadmap/WAYS-OF-WORKING.md`** (repo container root, two levels up) — cadence, gitflow, Definition
   of Done, the review stack. Follow it.
 - **`Roadmap/LEARNINGS.md`** — distilled wisdom from every past epic. Read it.
-- The frontend's **`apps/miyagisanchez/AGENTS.md`** — the five cross-cutting rules in full; the
+- The frontend's **`apps/storefront/AGENTS.md`** — the five cross-cutting rules in full; the
   commerce/agent contract is shared and this repo is the enforcement half of it.
 
 ---

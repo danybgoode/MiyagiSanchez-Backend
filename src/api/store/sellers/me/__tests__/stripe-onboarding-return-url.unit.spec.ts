@@ -14,7 +14,7 @@ import { join } from 'path'
  * exactly as asked. Only the destination was wrong.
  *
  * ── Why this spec is shaped like this ────────────────────────────────────────
- * The two halves live in DIFFERENT REPOSITORIES. `apps/miyagisanchez` is its own git
+ * The two halves live in DIFFERENT REPOSITORIES. `apps/storefront` is its own git
  * repo, gitignored from this one, so in CI this repo is checked out alone and the
  * storefront tree is simply not there.
  *

@@ -3,7 +3,7 @@
  *
  * Rental line-item pricing (epic 02 · checkout-and-payments) — Sprint 1, Story 1.1.
  *
- * Backend port of the spec-proven frontend seam `apps/miyagisanchez/lib/rental-pricing.ts`.
+ * Backend port of the spec-proven frontend seam `apps/storefront/lib/rental-pricing.ts`.
  * Pure, main()-less, cents-in — the SINGLE source of truth for the rental math, so the
  * charged total (start-checkout, S1.2) is computed from the same functions the PDP renders,
  * never re-derived inline. Kept byte-for-byte in step with the frontend seam; the only

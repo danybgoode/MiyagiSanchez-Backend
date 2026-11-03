@@ -13,7 +13,7 @@ export type YamlOffense = {
 // 2026-08-24: it queues merges to main, and a merge to main deploys — so it is deploy-critical by the
 // same definition, and a malformed workflow file is the silent kind of broken, since GitHub simply
 // never runs it and reports nothing). Mirrors the frontend's identical guard
-// (apps/miyagisanchez/lib/yaml-audit.ts) — same shape, independent copy (no shared-package mechanism
+// (apps/storefront/lib/yaml-audit.ts) — same shape, independent copy (no shared-package mechanism
 // exists across these two repos; see the epic's own retro for why duplication was the accepted call).
 export const canonicalYamlFiles = [
   'cloudbuild.yaml',

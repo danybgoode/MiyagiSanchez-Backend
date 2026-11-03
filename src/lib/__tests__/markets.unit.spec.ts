@@ -16,7 +16,7 @@ import {
 /**
  * THE GOLDEN SPEC for the market registry (epic market-architecture-foundation, D2).
  *
- * `src/lib/markets.ts` is duplicated BYTE-FOR-BYTE in `apps/miyagisanchez/lib/
+ * `src/lib/markets.ts` is duplicated BYTE-FOR-BYTE in `apps/storefront/lib/
  * markets.ts`. There is no shared package — the two repos have different build
  * systems — so the contract is held honest by this spec and its twin on the frontend
  * asserting EVERY FIELD OF EVERY RECORD. If one copy drifts, that copy's own gate

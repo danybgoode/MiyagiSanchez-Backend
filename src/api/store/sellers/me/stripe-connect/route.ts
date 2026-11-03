@@ -49,7 +49,7 @@ const SITE_URL = process.env.SITE_URL ?? process.env.NEXT_PUBLIC_SITE_URL ?? 'ht
  * Nothing failed loudly: the account was created, the link was valid, Stripe did
  * exactly as asked. Only the destination was wrong, and no backend test can see that
  * because the route lives in the other repo. `stripe-onboarding-return-url.unit.spec.ts`
- * pins the literal against `apps/miyagisanchez`'s own route tree, which is the only
+ * pins the literal against `apps/storefront`'s own route tree, which is the only
  * place the two halves can be compared.
  */
 const CONNECT_RETURN_PATH = '/shop/manage/settings/pagos'
