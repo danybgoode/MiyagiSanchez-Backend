@@ -9,19 +9,19 @@
  * The Stripe Product + Price are created by the Storefront's `scripts/seed-negocio-plan.mjs` (it holds the Stripe
  * lib), which then POSTs the price id here. Re-running updates the existing plan instead of creating a duplicate.
  *
- * Auth: x-internal-secret header must match MEDUSA_INTERNAL_SECRET.
+ * A failed lookup is a 500 and two existing Negocio plans are a 409 — never a silent second plan.
+ *
+ * Auth: x-internal-secret header must match MEDUSA_INTERNAL_SECRET (`internalSecretOk`).
  */
 import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
 import { SUBSCRIPTIONS_MODULE } from '../../../modules/subscriptions'
 import type SubscriptionsModuleService from '../../../modules/subscriptions/service'
 import { PLATFORM_SELLER_ID } from '../setup-custom-domain-plan/route'
-import { NEGOCIO_DEFAULT_MONTHLY_CENTS, NEGOCIO_PLAN_KIND, findNegocioPlan } from '../../../lib/negocio-plan'
+import { NEGOCIO_DEFAULT_MONTHLY_CENTS, NEGOCIO_PLAN_KIND, negocioPlans } from '../../../lib/negocio-plan'
+import { internalSecretOk } from '../../../lib/internal-auth'
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
-  const secret = req.headers['x-internal-secret']
-  if (!secret || secret !== process.env.MEDUSA_INTERNAL_SECRET) {
-    return res.status(401).json({ message: 'Unauthorized' })
-  }
+  if (!internalSecretOk(req)) return res.status(401).json({ message: 'Unauthorized' })
 
   const body = (req.body ?? {}) as { stripe_price_id?: string; price_cents?: number }
   if (!body.stripe_price_id) {
@@ -33,10 +33,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       : NEGOCIO_DEFAULT_MONTHLY_CENTS
 
   const subs = req.scope.resolve(SUBSCRIPTIONS_MODULE) as SubscriptionsModuleService
+  // No `.catch(() => [])`: a FAILED read must never look like "no plan yet", or a re-run seeds a duplicate and the
+  // webhook and the entitlement read can resolve different plans. A failure is a 500; the operator re-runs.
   const platformPlans: any[] = await (subs as any)
     .listSubscriptionPlans({ seller_id: PLATFORM_SELLER_ID }, { take: 100 })
-    .catch(() => [])
-  const existing = findNegocioPlan(platformPlans)
+  const found = negocioPlans(platformPlans)
+  if (found.length > 1) {
+    return res.status(409).json({
+      message: `${found.length} Negocio plans exist — resolve by hand before re-seeding (readers use the oldest).`,
+      plan_ids: found.map((p: any) => p.id),
+    })
+  }
+  const existing = found[0] ?? null
   const prevMeta = (existing?.metadata ?? {}) as Record<string, unknown>
 
   const fields = {

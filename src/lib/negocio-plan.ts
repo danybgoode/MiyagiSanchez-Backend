@@ -28,16 +28,47 @@ export const NEGOCIO_LIVE_STATUSES: ReadonlySet<string> = new Set(['active', 'tr
 /** Statuses the lapse path (the Stripe webhook) may set. */
 export const NEGOCIO_SETTABLE_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due', 'canceled'])
 
-type PlanLike = { metadata?: Record<string, unknown> | null } | null | undefined
-type SubscriptionLike = { status?: string | null; stripe_subscription_id?: string | null } | null | undefined
+type PlanLike = { id?: string; created_at?: string | Date | null; metadata?: Record<string, unknown> | null } | null | undefined
+type SubscriptionLike = {
+  status?: string | null
+  stripe_subscription_id?: string | null
+  seller_id?: string | null
+} | null | undefined
 
-/** The platform Negocio plan among the platform's plans, or null. Filtered in JS: metadata jsonb filters are not
- *  reliably supported by the list query (same reason as the ML-sync route). */
-export function findNegocioPlan<T extends PlanLike>(plans: readonly T[]): T | null {
-  return plans.find((p) => (p?.metadata as Record<string, unknown> | null | undefined)?.kind === NEGOCIO_PLAN_KIND) ?? null
+function isNegocio(p: PlanLike): boolean {
+  return (p?.metadata as Record<string, unknown> | null | undefined)?.kind === NEGOCIO_PLAN_KIND
 }
 
-/** The first live subscription row, or null. An unknown status is NOT live: "I cannot tell" never grants. */
-export function liveSubscription<T extends SubscriptionLike>(rows: readonly T[]): T | null {
-  return rows.find((r) => typeof r?.status === 'string' && NEGOCIO_LIVE_STATUSES.has(r.status)) ?? null
+function createdMs(p: PlanLike): number {
+  const t = p?.created_at instanceof Date ? p.created_at.getTime() : Date.parse(String(p?.created_at ?? ''))
+  return Number.isFinite(t) ? t : Number.POSITIVE_INFINITY
+}
+
+/** Every Negocio plan among the platform's plans, OLDEST first (ties by id). Filtered in JS: metadata jsonb filters
+ *  are not reliably supported by the list query. More than one is a seeding fault the setup route refuses. */
+export function negocioPlans<T extends PlanLike>(plans: readonly T[]): T[] {
+  return plans
+    .filter(isNegocio)
+    .sort((a, b) => createdMs(a) - createdMs(b) || String(a?.id ?? '').localeCompare(String(b?.id ?? '')))
+}
+
+/**
+ * THE Negocio plan: the oldest one. Deterministic on purpose — if a duplicate ever exists, the webhook that records a
+ * subscription and the read that checks it must resolve the SAME plan, or a paying seller reads as not paying.
+ */
+export function findNegocioPlan<T extends PlanLike>(plans: readonly T[]): T | null {
+  return negocioPlans(plans)[0] ?? null
+}
+
+/**
+ * The first live subscription row, or null. An unknown status is NOT live: "I cannot tell" never grants.
+ * Negocio is per SHOP (README D1): with `shopId`, only rows recorded for that shop count, so one monthly payment
+ * never opens Negocio on every shop the same person owns.
+ */
+export function liveSubscription<T extends SubscriptionLike>(rows: readonly T[], shopId?: string | null): T | null {
+  return rows.find((r) =>
+    typeof r?.status === 'string' &&
+    NEGOCIO_LIVE_STATUSES.has(r.status) &&
+    (!shopId || r.seller_id === shopId),
+  ) ?? null
 }

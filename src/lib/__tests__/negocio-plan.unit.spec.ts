@@ -1,4 +1,4 @@
-import { NEGOCIO_PLAN_KIND, findNegocioPlan, liveSubscription } from '../negocio-plan'
+import { NEGOCIO_PLAN_KIND, findNegocioPlan, liveSubscription, negocioPlans } from '../negocio-plan'
 
 /**
  * Negocio is a money entitlement: a wrong answer here either charges a merchant for a plan they do not get, or
@@ -20,7 +20,26 @@ describe('findNegocioPlan', () => {
   })
 })
 
+describe('negocioPlans — a duplicate never splits the webhook from the read', () => {
+  it('orders duplicates oldest first, so every reader resolves the same plan', () => {
+    const plans = [
+      { id: 'newer', created_at: '2026-11-05T00:00:00Z', metadata: { kind: NEGOCIO_PLAN_KIND } },
+      { id: 'older', created_at: '2026-11-04T00:00:00Z', metadata: { kind: NEGOCIO_PLAN_KIND } },
+    ]
+    expect(negocioPlans(plans).map((p) => p.id)).toEqual(['older', 'newer'])
+    expect(findNegocioPlan(plans)?.id).toBe('older')
+    // The same answer whatever order the list query returned them in.
+    expect(findNegocioPlan([...plans].reverse())?.id).toBe('older')
+  })
+})
+
 describe('liveSubscription', () => {
+  it('per shop: with a shop id, another shop\'s live subscription does not count', () => {
+    const rows = [{ status: 'active', seller_id: 'shop-a', stripe_subscription_id: 'sub_a' }]
+    expect(liveSubscription(rows, 'shop-b')).toBeNull()
+    expect(liveSubscription(rows, 'shop-a')?.stripe_subscription_id).toBe('sub_a')
+  })
+
   it('counts active, trialing and past_due as live (past_due is the card-retry grace window)', () => {
     for (const status of ['active', 'trialing', 'past_due']) {
       expect(liveSubscription([{ status, stripe_subscription_id: 'sub_1' }])?.stripe_subscription_id).toBe('sub_1')
