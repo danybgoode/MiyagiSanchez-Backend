@@ -34,29 +34,30 @@ describe('negocioPlans — a duplicate never splits the webhook from the read', 
 })
 
 describe('liveSubscription', () => {
-  it('per shop: with a shop id, another shop\'s live subscription does not count', () => {
+  it('per shop: another shop\'s live subscription does not count, and an empty shop id matches nothing', () => {
     const rows = [{ status: 'active', seller_id: 'shop-a', stripe_subscription_id: 'sub_a' }]
     expect(liveSubscription(rows, 'shop-b')).toBeNull()
+    expect(liveSubscription(rows, '')).toBeNull()
     expect(liveSubscription(rows, 'shop-a')?.stripe_subscription_id).toBe('sub_a')
   })
 
   it('counts active, trialing and past_due as live (past_due is the card-retry grace window)', () => {
     for (const status of ['active', 'trialing', 'past_due']) {
-      expect(liveSubscription([{ status, stripe_subscription_id: 'sub_1' }])?.stripe_subscription_id).toBe('sub_1')
+      expect(liveSubscription([{ status, seller_id: 's', stripe_subscription_id: 'sub_1' }], 's')?.stripe_subscription_id).toBe('sub_1')
     }
   })
 
   it('never counts canceled, an unknown status or a missing status as live', () => {
-    expect(liveSubscription([{ status: 'canceled' }])).toBeNull()
-    expect(liveSubscription([{ status: 'incomplete_expired' }])).toBeNull()
-    expect(liveSubscription([{ status: null }, {}])).toBeNull()
+    expect(liveSubscription([{ status: 'canceled', seller_id: 's' }], 's')).toBeNull()
+    expect(liveSubscription([{ status: 'incomplete_expired', seller_id: 's' }], 's')).toBeNull()
+    expect(liveSubscription([{ status: null, seller_id: 's' }, { seller_id: 's' }], 's')).toBeNull()
   })
 
   it('finds the live row behind a canceled one', () => {
     const rows = [
-      { status: 'canceled', stripe_subscription_id: 'old' },
-      { status: 'active', stripe_subscription_id: 'new' },
+      { status: 'canceled', seller_id: 's', stripe_subscription_id: 'old' },
+      { status: 'active', seller_id: 's', stripe_subscription_id: 'new' },
     ]
-    expect(liveSubscription(rows)?.stripe_subscription_id).toBe('new')
+    expect(liveSubscription(rows, 's')?.stripe_subscription_id).toBe('new')
   })
 })

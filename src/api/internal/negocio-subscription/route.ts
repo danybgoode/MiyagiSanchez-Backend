@@ -1,12 +1,12 @@
 /**
- * GET /internal/negocio-subscription?seller_clerk_id=...&shop_id=...
+ * GET /internal/negocio-subscription?seller_clerk_id=...&shop_id=...  (both required)
  *
  * Source of truth for "does this seller have a LIVE monthly Negocio subscription?" (epic 08 · plans-gratis-negocio
  * S1.1, README D1/D3). A clone of `/internal/ml-sync-subscription` onto the Negocio plan. The Storefront's plan
  * composer (`lib/plan-server.ts`) feeds `active` into the pure `derivePlan` seam.
  *
- * Negocio is per SHOP (README D1): with `shop_id` (the marketplace shop id the webhook records as the subscription's
- * `seller_id`), only that shop's subscription counts. Returns `{ active, plan_id, stripe_price_id, price_cents,
+ * Negocio is per SHOP (README D1): `shop_id` (the marketplace shop id the webhook records as the subscription's
+ * `seller_id`) is required, and only that shop's subscription counts. Returns `{ active, plan_id, stripe_price_id, price_cents,
  * subscription_id }`; on a failed subscription read it still returns the resolved `plan_id` with `reason: 'error'`,
  * so the activation webhook can record a paid subscription even when this seller's rows could not be listed. Every
  * failure answers `active: false` with a `reason`, so a backend hiccup never grants Negocio.
@@ -32,10 +32,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     return res.status(400).json({ message: 'seller_clerk_id query param is required' })
   }
 
-  const shopId = (req.query.shop_id as string | undefined) || null
+  // REQUIRED: Negocio is per shop. A missing shop_id must never mean "any of this person's shops" (Codex, #224).
+  const shopId = req.query.shop_id as string | undefined
+  if (!shopId) {
+    return res.status(400).json({ message: 'shop_id query param is required' })
+  }
   const subs = req.scope.resolve(SUBSCRIPTIONS_MODULE) as SubscriptionsModuleService
 
-  let plan: any = null
+  let plan: any
   try {
     plan = findNegocioPlan(await (subs as any).listSubscriptionPlans({ seller_id: PLATFORM_SELLER_ID }, { take: 100 }))
   } catch (e) {

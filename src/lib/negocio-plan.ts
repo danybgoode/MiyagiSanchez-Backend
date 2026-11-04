@@ -62,13 +62,14 @@ export function findNegocioPlan<T extends PlanLike>(plans: readonly T[]): T | nu
 
 /**
  * The first live subscription row, or null. An unknown status is NOT live: "I cannot tell" never grants.
- * Negocio is per SHOP (README D1): with `shopId`, only rows recorded for that shop count, so one monthly payment
- * never opens Negocio on every shop the same person owns.
+ * Negocio is per SHOP (README D1): only rows recorded for `shopId` count, so one monthly payment never opens Negocio
+ * on every shop the same person owns. There is no wildcard — an empty shop id matches nothing.
  */
-export function liveSubscription<T extends SubscriptionLike>(rows: readonly T[], shopId?: string | null): T | null {
+export function liveSubscription<T extends SubscriptionLike>(rows: readonly T[], shopId: string): T | null {
+  if (!shopId) return null
   return rows.find((r) =>
     typeof r?.status === 'string' &&
     NEGOCIO_LIVE_STATUSES.has(r.status) &&
-    (!shopId || r.seller_id === shopId),
+    r.seller_id === shopId,
   ) ?? null
 }
