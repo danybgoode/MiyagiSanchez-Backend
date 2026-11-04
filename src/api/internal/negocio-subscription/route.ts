@@ -13,7 +13,9 @@
  *
  * PATCH /internal/negocio-subscription  { stripe_subscription_id, status }
  *   — the lapse path: the Stripe webhook knows only the Stripe subscription id, and entitlement reads Medusa.
- *   Answers `{ updated }` counting rows that actually changed, so a silent no-op is visible to the caller.
+ *   Answers `{ updated }` = the Negocio rows found for that Stripe id AND written successfully. Re-setting the status a
+ *   row already has (a replayed webhook) counts, on purpose: the caller asks "is this subscription now at status X?",
+ *   and 0 means the honest failure — no such Negocio row, or every write failed.
  *
  * Auth: x-internal-secret header must match MEDUSA_INTERNAL_SECRET (`internalSecretOk`).
  */
