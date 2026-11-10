@@ -249,8 +249,9 @@ export async function readPlanSubscription(
  * PATCH /internal/<kind>-subscription  { stripe_subscription_id, status }
  *
  * The lapse path. Answers `{ updated }` = the rows of THIS plan found for that Stripe id AND written successfully.
- * Re-setting the status a row already has (a replayed webhook) counts, on purpose: the caller asks "is this
- * subscription now at status X?", and 0 means the honest failure — no such row on this plan, or every write failed.
+ * Re-setting the status a row already has (a replayed webhook) counts, on purpose, and so does a row that is already
+ * `canceled` and is left that way (see the loop): 0 means the honest failure — no such row on this plan, or every
+ * write failed.
  */
 export async function setPlanSubscriptionStatus(
   spec: PlanKindSpec,
@@ -276,6 +277,16 @@ export async function setPlanSubscriptionStatus(
 
   let updated = 0
   for (const r of rows) {
+    // `canceled` is FINAL. Stripe ends a subscription once, but it does not promise event order: a late
+    // `customer.subscription.updated` (active / past_due / trialing) can arrive AFTER the deletion. Writing it would
+    // set a cancelled row live again — a paid plan nobody is paying for, with no later event to end it. So a
+    // cancelled row is never written. It is still COUNTED: the caller reads 0 as "no such subscription" and raises an
+    // alarm, and this row was found and is in the only state it can be in. (`canceled` over `canceled`, a replayed
+    // deletion, lands here too.) A new subscription for the same shop is a new Stripe id and a new row.
+    if (r.status === 'canceled') {
+      updated++
+      continue
+    }
     try {
       // `{ id, ...fields }` in ONE argument, the shape Medusa's generated `update<Model>s` takes. The lapse routes
       // of the older platform plans call `updateSubscriptions(id, { status })`; the generated method reads its

@@ -13,7 +13,7 @@ const SECRET = 'plan-routes-secret'
 const NEG = { id: 'subplan_neg', seller_id: 'platform', stripe_price_id: 'price_neg', price_cents: 14900, metadata: { kind: 'negocio_plan' } }
 const TIE = { id: 'subplan_tie', seller_id: 'platform', stripe_price_id: 'price_tie', price_cents: 2900, metadata: { kind: 'tienda_plan' } }
 
-function harness(over: { secret?: string | null; body?: unknown; query?: unknown; plans?: any[] } = {}) {
+function harness(over: { secret?: string | null; body?: unknown; query?: unknown; plans?: any[]; brokenModule?: boolean } = {}) {
   const plans = over.plans ?? [NEG, TIE]
   const subscriptions = [
     { id: 'sub_n', plan_id: 'subplan_neg', clerk_user_id: 'user_1', seller_id: 'shop_1', status: 'active', stripe_subscription_id: 'stripe_n' },
@@ -33,7 +33,13 @@ function harness(over: { secret?: string | null; body?: unknown; query?: unknown
     headers: over.secret === null ? {} : { 'x-internal-secret': over.secret ?? SECRET },
     body: over.body,
     query: over.query ?? {},
-    scope: { resolve: (key: string) => { resolved.push(key); return module } },
+    scope: {
+      resolve: (key: string) => {
+        resolved.push(key)
+        if (over.brokenModule) throw new Error('could not resolve the subscriptions module')
+        return module
+      },
+    },
   }
   const out: { status: number; body: any } = { status: 200, body: undefined }
   const res: any = {
@@ -66,6 +72,36 @@ describe('the paid plans\' internal routes', () => {
       expect(h.created).toEqual([])
       expect(h.subscriptions.map((s) => s.status)).toEqual(['active', 'active'])
     }
+  })
+
+  const MALFORMED: Array<[string, (req: any, res: any) => Promise<unknown>, { body?: unknown; query?: unknown }]> = [
+    ['POST setup-tienda-plan without stripe_price_id', setupTienda, { body: { price_cents: 2900 } }],
+    ['POST setup-tienda-plan with no body', setupTienda, {}],
+    ['GET tienda-subscription without shop_id', tiendaSubscription.GET, { query: { seller_clerk_id: 'user_1' } }],
+    ['PATCH tienda-subscription with an unsupported status', tiendaSubscription.PATCH, { body: { stripe_subscription_id: 'stripe_t', status: 'free_forever' } }],
+    ['POST setup-negocio-plan without stripe_price_id', setupNegocio, { body: {} }],
+    ['GET negocio-subscription without seller_clerk_id', negocioSubscription.GET, { query: { shop_id: 'shop_1' } }],
+    ['PATCH negocio-subscription without a status', negocioSubscription.PATCH, { body: { stripe_subscription_id: 'stripe_n' } }],
+  ]
+
+  it.each(MALFORMED)('%s answers 400 even when the module cannot be resolved, and never resolves it', async (_name, route, input) => {
+    const h = harness({ ...input, brokenModule: true })
+    await route(h.req, h.res)
+    expect(h.out.status).toBe(400)
+    expect(typeof h.out.body.message).toBe('string')
+    expect(h.resolved).toEqual([])
+  })
+
+  it('a WELL-formed request still fails loudly when the module cannot be resolved: never a quiet answer', async () => {
+    const h = harness({ body: { stripe_price_id: 'price_tie' }, brokenModule: true })
+    await expect(setupTienda(h.req, h.res)).rejects.toThrow('could not resolve the subscriptions module')
+    expect(h.created).toEqual([])
+  })
+
+  it('resolves the module once per request', async () => {
+    const h = harness({ body: { stripe_subscription_id: 'stripe_t', status: 'canceled' } })
+    await tiendaSubscription.PATCH(h.req, h.res)
+    expect(h.resolved).toEqual([SUBSCRIPTIONS_MODULE])
   })
 
   it('GET tienda-subscription answers the Tienda subscription, GET negocio-subscription the Negocio one', async () => {

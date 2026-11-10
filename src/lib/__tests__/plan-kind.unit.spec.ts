@@ -302,8 +302,9 @@ describe('setPlanSubscriptionStatus — Plan Tienda', () => {
   })
 
   it('a replay (the status the row already has) still counts as updated', async () => {
-    const s = makeStore({ plans: [TIE], subscriptions: [sub('a', TIE, { status: 'canceled' })] })
-    expect((await setPlanSubscriptionStatus(TIENDA_PLAN_SPEC, { stripe_subscription_id: 'stripe_a', status: 'canceled' }, s.deps)).body.updated).toBe(1)
+    const s = makeStore({ plans: [TIE], subscriptions: [sub('a', TIE, { status: 'past_due' })] })
+    expect((await setPlanSubscriptionStatus(TIENDA_PLAN_SPEC, { stripe_subscription_id: 'stripe_a', status: 'past_due' }, s.deps)).body.updated).toBe(1)
+    expect(s.subscriptions[0].status).toBe('past_due')
   })
 
   it('counts only the writes that landed: a failed write is not "updated"', async () => {
@@ -320,5 +321,48 @@ describe('setPlanSubscriptionStatus — Plan Tienda', () => {
     const s = makeStore({ plans: [TIE] })
     s.deps.subs.listSubscriptions = async () => { throw new Error('db down') }
     await expect(setPlanSubscriptionStatus(TIENDA_PLAN_SPEC, { stripe_subscription_id: 'x', status: 'canceled' }, s.deps)).rejects.toThrow('db down')
+  })
+})
+
+/**
+ * Stripe does not promise event order. A `customer.subscription.updated` sent before the cancellation can be
+ * delivered after it; if that write landed, a cancelled plan would be live again with nobody paying for it.
+ */
+describe.each(BOTH)('setPlanSubscriptionStatus — %s: canceled is final', (_name, spec, own) => {
+  const canceled = () => makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own, { status: 'canceled' })] })
+  const set = (s: ReturnType<typeof makeStore>, status: string) =>
+    setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status }, s.deps)
+
+  it.each(['active', 'past_due', 'trialing'])('a late %s after the cancellation leaves the row canceled, and still counts it', async (late) => {
+    const s = canceled()
+    expect(await set(s, late)).toEqual({ status: 200, body: { updated: 1 } })
+    expect(s.subscriptions[0].status).toBe('canceled')
+    expect(s.calls.updateSub).toEqual([])
+    // ...so the read never grants the plan again.
+    expect((await readPlanSubscription(spec, { seller_clerk_id: 'user_1', shop_id: 'shop_1' }, s.deps)).body.active).toBe(false)
+  })
+
+  it('a replayed cancellation is counted and the row stays canceled', async () => {
+    const s = canceled()
+    expect(await set(s, 'canceled')).toEqual({ status: 200, body: { updated: 1 } })
+    expect(s.subscriptions[0].status).toBe('canceled')
+  })
+
+  it('a live row can still be canceled, and can still move between live statuses', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own, { status: 'past_due' })] })
+    expect((await set(s, 'active')).body.updated).toBe(1)
+    expect(s.subscriptions[0].status).toBe('active')
+    expect((await set(s, 'canceled')).body.updated).toBe(1)
+    expect(s.subscriptions[0].status).toBe('canceled')
+  })
+
+  it('of two rows for one Stripe id, only the one that is not canceled is written; both are counted', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [
+      sub('a', own, { status: 'canceled', stripe_subscription_id: 'sub_X' }),
+      sub('b', own, { status: 'past_due', stripe_subscription_id: 'sub_X' }),
+    ] })
+    const a = await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'sub_X', status: 'active' }, s.deps)
+    expect(a.body.updated).toBe(2)
+    expect(s.subscriptions.map((r) => r.status)).toEqual(['canceled', 'active'])
   })
 })

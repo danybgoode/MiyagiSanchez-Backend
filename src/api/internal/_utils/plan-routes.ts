@@ -18,6 +18,7 @@ import {
   setupPlanOfKind,
   type PlanDeps,
   type PlanKindSpec,
+  type PlanStore,
   type RouteAnswer,
 } from '../../../lib/plan-kind'
 
@@ -27,11 +28,19 @@ type Body = (spec: PlanKindSpec, input: Record<string, unknown>, deps: PlanDeps)
 function handler(spec: PlanKindSpec, body: Body, input: (req: MedusaRequest) => unknown): Handler {
   return async (req, res) => {
     if (!internalSecretOk(req)) return res.status(401).json({ message: 'Unauthorized' })
-    const answer = await body(spec, (input(req) ?? {}) as Record<string, unknown>, {
-      subs: req.scope.resolve(SUBSCRIPTIONS_MODULE),
+    // The module is resolved LAZILY, on the body's first use of the store. Every body validates its input before it
+    // reads anything, so a malformed request answers its 400 even when the module cannot be resolved; resolving up
+    // front turned that into a 500, which a caller retries instead of fixing. It also keeps the order
+    // secret -> input -> database in one place for both plans.
+    let subs: PlanStore | undefined
+    const deps: PlanDeps = {
+      get subs() {
+        return (subs ??= req.scope.resolve(SUBSCRIPTIONS_MODULE))
+      },
       platformSellerId: PLATFORM_SELLER_ID,
       logError: (message, error) => console.error(message, error),
-    })
+    }
+    const answer = await body(spec, (input(req) ?? {}) as Record<string, unknown>, deps)
     return res.status(answer.status).json(answer.body)
   }
 }
