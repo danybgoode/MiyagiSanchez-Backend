@@ -28,6 +28,7 @@ import { SUBSCRIPTIONS_MODULE } from '../../../modules/subscriptions'
 import type SubscriptionsModuleService from '../../../modules/subscriptions/service'
 import { PLATFORM_SELLER_ID } from '../setup-custom-domain-plan/route'
 import { ML_SYNC_PLAN_KIND } from '../setup-ml-sync-plan/route'
+import { platformSkuStatusHandler } from '../_utils/plan-routes'
 
 // `past_due` counts as live: it's a grace window while Stripe retries the card, so a
 // transient payment failure never collapses the seller's sync. Only a definitive
@@ -79,39 +80,11 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   }
 }
 
-const SETTABLE_STATUSES = new Set(['active', 'trialing', 'past_due', 'canceled'])
-
-export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
-  const secret = req.headers['x-internal-secret']
-  if (!secret || secret !== process.env.MEDUSA_INTERNAL_SECRET) {
-    return res.status(401).json({ message: 'Unauthorized' })
-  }
-
-  const body = (req.body ?? {}) as { stripe_subscription_id?: string; status?: string }
-  if (!body.stripe_subscription_id || !body.status) {
-    return res.status(400).json({ message: 'stripe_subscription_id and status are required' })
-  }
-  if (!SETTABLE_STATUSES.has(body.status)) {
-    return res.status(400).json({ message: `unsupported status: ${body.status}` })
-  }
-
-  const subs = req.scope.resolve(SUBSCRIPTIONS_MODULE) as SubscriptionsModuleService
-  const rows: any[] = await (subs as any)
-    .listSubscriptions({ stripe_subscription_id: body.stripe_subscription_id }, { take: 50 })
-    .catch(() => [])
-
-  // Count only rows that actually updated — so `updated: 0` is HONEST (no matching
-  // row, or every update failed) rather than reporting the lookup count. The FE lapse
-  // caller checks this to catch a silent failure on a money-path status change.
-  let updated = 0
-  for (const r of rows) {
-    try {
-      await (subs as any).updateSubscriptions(r.id, { status: body.status })
-      updated++
-    } catch (e) {
-      console.error(`[ml-sync-subscription] status update failed for ${r.id}:`, e)
-    }
-  }
-
-  return res.json({ updated })
-}
+// The lapse path. Its write is the shared conditional statement (`setPlatformSkuSubscriptionStatus`,
+// `src/lib/plan-kind.ts`): it lands, and it never moves a row out of `canceled`. Until 2026-11 this called
+// `updateSubscriptions(r.id, { status })` — the id as the data argument — so no status sent here was ever written.
+export const PATCH = platformSkuStatusHandler({
+  kind: ML_SYNC_PLAN_KIND,
+  label: 'sincronización con Mercado Libre',
+  logTag: 'ml-sync-subscription',
+})

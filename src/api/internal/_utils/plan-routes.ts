@@ -5,6 +5,9 @@
  * the auth check, the module wiring and the response shape cannot differ between the two plans; each `route.ts`
  * is one line naming its plan. Every decision lives in `src/lib/plan-kind.ts` and is unit-tested there.
  *
+ * The older platform SKUs (custom domain, subdomain, ML sync) reuse the lapse handler's shell through
+ * `platformSkuStatusHandler`, so their status writes are the same conditional statement.
+ *
  * Auth: x-internal-secret header must match MEDUSA_INTERNAL_SECRET (`internalSecretOk`, fail-closed on a missing
  * secret). It runs BEFORE anything is read from the request or the database.
  */
@@ -16,18 +19,20 @@ import { internalSecretOk } from '../../../lib/internal-auth'
 import {
   readPlanSubscription,
   setPlanSubscriptionStatus,
+  setPlatformSkuSubscriptionStatus,
   setupPlanOfKind,
   statusWriteStatement,
   type PlanDeps,
   type PlanKindSpec,
+  type PlatformSkuSpec,
   type PlanStore,
   type RouteAnswer,
 } from '../../../lib/plan-kind'
 
 type Handler = (req: MedusaRequest, res: MedusaResponse) => Promise<unknown>
-type Body = (spec: PlanKindSpec, input: Record<string, unknown>, deps: PlanDeps) => Promise<RouteAnswer>
+type Body<S> = (spec: S, input: Record<string, unknown>, deps: PlanDeps) => Promise<RouteAnswer>
 
-function handler(spec: PlanKindSpec, body: Body, input: (req: MedusaRequest) => unknown): Handler {
+function handler<S>(spec: S, body: Body<S>, input: (req: MedusaRequest) => unknown): Handler {
   return async (req, res) => {
     if (!internalSecretOk(req)) return res.status(401).json({ message: 'Unauthorized' })
     // The module is resolved LAZILY, on the body's first use of the store. Every body validates its input before it
@@ -66,3 +71,8 @@ export const planSubscriptionReadHandler = (spec: PlanKindSpec): Handler =>
 /** PATCH /internal/<plan>-subscription */
 export const planSubscriptionStatusHandler = (spec: PlanKindSpec): Handler =>
   handler(spec, setPlanSubscriptionStatus, (req) => req.body)
+
+/** PATCH /internal/{custom-domain,subdomain,ml-sync}-subscription — the older SKUs' lapse path, on the same shell
+ *  and the same conditional write as the paid plans (see `setPlatformSkuSubscriptionStatus`). */
+export const platformSkuStatusHandler = (spec: PlatformSkuSpec): Handler =>
+  handler(spec, setPlatformSkuSubscriptionStatus, (req) => req.body)
