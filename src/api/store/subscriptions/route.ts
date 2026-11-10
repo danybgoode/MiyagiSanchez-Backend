@@ -116,23 +116,39 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   return res.status(201).json({ subscription, created: true })
 }
 
-// ── GET /store/subscriptions?plan_id=xxx ──────────────────────────────────────
-// Light public endpoint — check if a buyer has an active subscription for a plan
+// ── GET /store/subscriptions?plan_id=…&buyer_email=… ──────────────────────────
+// Does a buyer have a live subscription to a plan? Server-to-server only (#229).
+//
+// It used to be public behind the publishable key alone, and it passed the query straight into the filter. Express's
+// default query parser turns `plan_id[$ne]=x&buyer_email[$like]=a%25` into `{ $ne: 'x' }` / `{ $like: 'a%' }`, which
+// the module's filter accepts, so anyone holding the browser key could walk every live row one email prefix at a
+// time: buyer emails, Clerk ids and Stripe ids, merchants' included (verifier, #229). No storefront code calls it.
+// So: the internal secret first, then only plain strings are accepted, and the answer carries no row data.
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
-  const query = req.query as Record<string, string>
+  if (!internalSecretOk(req)) {
+    return res.status(401).json({ message: 'Unauthorized' })
+  }
+  const query = (req.query ?? {}) as Record<string, unknown>
   const planId = query.plan_id
   const buyerEmail = query.buyer_email
 
-  if (!planId || !buyerEmail) {
-    return res.status(400).json({ message: 'plan_id and buyer_email are required' })
+  if (typeof planId !== 'string' || !planId || typeof buyerEmail !== 'string' || !buyerEmail) {
+    return res.status(400).json({ message: 'plan_id and buyer_email are required, as plain strings' })
   }
 
   const subsService: SubscriptionsModuleService = req.scope.resolve(SUBSCRIPTIONS_MODULE)
-  const subscriptions = await (subsService as any).listSubscriptions(
-    { plan_id: planId, buyer_email: buyerEmail, status: ['active', 'trialing'] },
-    { take: 1 }
-  ).catch(() => [])
+  let subscriptions: unknown[]
+  try {
+    subscriptions = await (subsService as any).listSubscriptions(
+      { plan_id: planId, buyer_email: buyerEmail, status: ['active', 'trialing'] },
+      { take: 1 }
+    )
+  } catch (e) {
+    // "Could not look" is not "no access": answer 503, never has_access: false.
+    console.error('[store/subscriptions] GET failed:', e)
+    return res.status(503).json({ message: 'Could not check the subscription right now.' })
+  }
 
-  return res.json({ has_access: subscriptions.length > 0, subscriptions })
+  return res.json({ has_access: Array.isArray(subscriptions) && subscriptions.length > 0 })
 }

@@ -1,7 +1,7 @@
-import { POST as recordSubscription } from '../subscriptions/route'
+import { POST as recordSubscription, GET as checkAccess } from '../subscriptions/route'
 import { PATCH as buyerPatch } from '../buyer/me/subscriptions/[id]/route'
 import { recordVerifiedClerkIdentity } from '../_utils/clerk-verify'
-import { buyerPlanRefusal, buyerSubscriptionUpdates } from '../../../lib/buyer-subscription-update'
+import { buyerPlanRefusal, buyerProcessorRefusal, buyerSubscriptionUpdates } from '../../../lib/buyer-subscription-update'
 
 /**
  * Two store routes that wrote a subscription's status with `updateSubscriptions(id, patch)` — the id as the data
@@ -15,7 +15,8 @@ function harness(seed: { subscriptions?: any[]; plans?: any[]; planLookupFails?:
   const plans = seed.plans ?? []
   const updates: any[] = []
   const created: any[] = []
-  const match = (row: any, f: any) => Object.entries(f).every(([k, v]) => row[k] === v)
+  // An array value is an IN list, as in Medusa's filters.
+  const match = (row: any, f: any) => Object.entries(f).every(([k, v]) => (Array.isArray(v) ? v.includes(row[k]) : row[k] === v))
   const module = {
     listSubscriptions: async (f: any) => subscriptions.filter((s) => match(s, f)).map((s) => ({ ...s })),
     listSubscriptionPlans: async (f: any) => {
@@ -37,8 +38,8 @@ function harness(seed: { subscriptions?: any[]; plans?: any[]; planLookupFails?:
     status(code: number) { out.status = code; return res },
     json(body: any) { out.body = body; return res },
   }
-  const req = (over: { headers?: any; body?: any; params?: any; clerk?: string | null } = {}) => {
-    const r: any = { headers: over.headers ?? {}, body: over.body, params: over.params ?? {}, scope: { resolve: () => module } }
+  const req = (over: { headers?: any; body?: any; params?: any; query?: any; clerk?: string | null } = {}) => {
+    const r: any = { headers: over.headers ?? {}, body: over.body, params: over.params ?? {}, query: over.query ?? {}, scope: { resolve: () => module } }
     if (over.clerk !== undefined) recordVerifiedClerkIdentity(r, over.clerk ? { sub: over.clerk } : null)
     return r
   }
@@ -84,7 +85,8 @@ describe('POST /store/subscriptions — a replay changes no status', () => {
 
 const SELLER_PLAN = { id: 'plan_seller', seller_id: 'shop_9' }
 const PLATFORM_PLAN = { id: 'plan_platform', seller_id: 'platform', metadata: { kind: 'tienda_plan' } }
-const mine = (plan: any, over: any = {}) => ({ id: 'sub_1', plan_id: plan.id, clerk_user_id: 'user_buyer', status: 'active', cancel_at_period_end: false, ...over })
+// SPEI by default: the only kind of subscription this route may change (nobody bills it automatically).
+const mine = (plan: any, over: any = {}) => ({ id: 'sub_1', plan_id: plan.id, clerk_user_id: 'user_buyer', status: 'active', cancel_at_period_end: false, payment_method: 'spei', ...over })
 
 describe('PATCH /store/buyer/me/subscriptions/:id', () => {
   it('a buyer cancels their own subscription to a seller\'s plan: the write LANDS', async () => {
@@ -139,6 +141,21 @@ describe('PATCH /store/buyer/me/subscriptions/:id', () => {
     expect(gone.updates).toEqual([])
   })
 
+  it('a subscription a processor bills is refused: 409, nothing written (the processor would keep charging)', async () => {
+    for (const over of [
+      { payment_method: 'stripe', stripe_subscription_id: 'sub_stripe_1' },
+      { payment_method: 'mercadopago', mp_preapproval_id: 'pre_1' },
+      { payment_method: 'spei', stripe_subscription_id: 'sub_stripe_2' }, // an id wins over the label
+      { payment_method: undefined },
+    ]) {
+      const h = harness({ subscriptions: [mine(SELLER_PLAN, over)], plans: [SELLER_PLAN] })
+      await buyerPatch(h.req({ clerk: 'user_buyer', params: { id: 'sub_1' }, body: { status: 'canceled' } }), h.res)
+      expect(h.out.status).toBe(409)
+      expect(h.out.body.code).toBe('processor_billed')
+      expect(h.updates).toEqual([])
+    }
+  })
+
   it('a body asking for nothing allowed is a 400', async () => {
     const h = harness({ subscriptions: [mine(SELLER_PLAN)], plans: [SELLER_PLAN] })
     await buyerPatch(h.req({ clerk: 'user_buyer', params: { id: 'sub_1' }, body: { status: 'active' } }), h.res)
@@ -163,5 +180,55 @@ describe('buyer subscription decisions', () => {
     expect(buyerPlanRefusal({ state: 'absent' }, 'platform')?.status).toBe(409)
     expect(buyerPlanRefusal({ state: 'unavailable' }, 'platform')?.status).toBe(503)
     expect(buyerPlanRefusal({ state: 'found', plan: { seller_id: 'shop_9' } }, '')?.status).toBe(409)
+    // A plan whose seller is missing or empty is never "a seller's" (Codex, #229).
+    expect(buyerPlanRefusal({ state: 'found', plan: { seller_id: null } }, 'platform')?.status).toBe(409)
+    expect(buyerPlanRefusal({ state: 'found', plan: {} }, 'platform')?.status).toBe(409)
+    expect(buyerPlanRefusal({ state: 'found', plan: { seller_id: '' } }, 'platform')?.status).toBe(409)
+  })
+
+  it('only a SPEI subscription with no processor id may be changed here', () => {
+    expect(buyerProcessorRefusal({ payment_method: 'spei' })).toBeNull()
+    expect(buyerProcessorRefusal({ payment_method: 'stripe' })?.status).toBe(409)
+    expect(buyerProcessorRefusal({ payment_method: 'mercadopago' })?.status).toBe(409)
+    expect(buyerProcessorRefusal({})?.status).toBe(409)
+    expect(buyerProcessorRefusal({ payment_method: 'spei', mp_preapproval_id: 'pre_1' })?.status).toBe(409)
+  })
+})
+
+describe('GET /store/subscriptions — server-to-server, plain strings only, no row data (#229)', () => {
+  const seeded = () => harness({ subscriptions: [{ id: 'sub_1', plan_id: 'plan_seller', buyer_email: 'a@b.mx', status: 'active', stripe_customer_id: 'cus_1' }] })
+  const withSecret = { 'x-internal-secret': SECRET }
+  beforeEach(() => { process.env.MEDUSA_INTERNAL_SECRET = SECRET })
+
+  it('without the internal secret: 401, nothing read', async () => {
+    const h = seeded()
+    let read = false
+    h.module.listSubscriptions = async () => { read = true; return [] }
+    await checkAccess(h.req({ query: { plan_id: 'plan_seller', buyer_email: 'a@b.mx' } }), h.res)
+    expect(h.out.status).toBe(401)
+    expect(read).toBe(false)
+  })
+
+  it('an operator object in the query (plan_id[$ne]=x) is a 400, never a filter', async () => {
+    const h = seeded()
+    let read = false
+    h.module.listSubscriptions = async () => { read = true; return [] }
+    await checkAccess(h.req({ headers: withSecret, query: { plan_id: { $ne: 'x' }, buyer_email: { $like: 'a%' } } }), h.res)
+    expect(h.out.status).toBe(400)
+    expect(read).toBe(false)
+  })
+
+  it('answers has_access and nothing else: no emails, ids or rows', async () => {
+    const h = seeded()
+    await checkAccess(h.req({ headers: withSecret, query: { plan_id: 'plan_seller', buyer_email: 'a@b.mx' } }), h.res)
+    expect(h.out.status).toBe(200)
+    expect(h.out.body).toEqual({ has_access: true })
+  })
+
+  it('a failed read is a 503, never has_access: false', async () => {
+    const h = seeded()
+    h.module.listSubscriptions = async () => { throw new Error('db down') }
+    await checkAccess(h.req({ headers: withSecret, query: { plan_id: 'plan_seller', buyer_email: 'a@b.mx' } }), h.res)
+    expect(h.out.status).toBe(503)
   })
 })

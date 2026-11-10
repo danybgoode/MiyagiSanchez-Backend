@@ -10,8 +10,8 @@
  * Security: the row is read with the caller's Clerk id IN the filter, so another person's subscription is a 404.
  * A platform plan's subscription is refused (see `src/lib/buyer-subscription-update.ts`).
  *
- * Medusa only: this does NOT cancel anything in Stripe or Mercado Pago. The row's status changes here; billing at
- * the processor is untouched.
+ * Medusa only: this does NOT cancel anything in Stripe or Mercado Pago, so a subscription a processor bills is
+ * refused (`buyerProcessorRefusal`); only SPEI subscriptions, which nobody bills automatically, can be changed here.
  */
 
 import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
@@ -19,7 +19,7 @@ import { SUBSCRIPTIONS_MODULE } from '../../../../../../modules/subscriptions'
 import SubscriptionsModuleService from '../../../../../../modules/subscriptions/service'
 import { extractClerkUserId } from '../../../../_utils/clerk-auth'
 import { PLATFORM_SELLER_ID } from '../../../../../internal/setup-custom-domain-plan/route'
-import { buyerPlanRefusal, buyerSubscriptionUpdates, type PlanLookup } from '../../../../../../lib/buyer-subscription-update'
+import { buyerPlanRefusal, buyerProcessorRefusal, buyerSubscriptionUpdates, type PlanLookup } from '../../../../../../lib/buyer-subscription-update'
 
 export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
   const clerkUserId = extractClerkUserId(req)
@@ -60,7 +60,7 @@ export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
     console.error('[buyer-subscription] plan lookup failed:', e)
     lookup = { state: 'unavailable' }
   }
-  const refusal = buyerPlanRefusal(lookup, PLATFORM_SELLER_ID)
+  const refusal = buyerPlanRefusal(lookup, PLATFORM_SELLER_ID) ?? buyerProcessorRefusal(subscription)
   if (refusal) return res.status(refusal.status).json(refusal.body)
 
   // ONE argument: the generated `updateSubscriptions(data, sharedContext)` takes the id inside the data. The old

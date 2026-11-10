@@ -40,12 +40,42 @@ export function buyerPlanRefusal(lookup: PlanLookup, platformSellerId: string): 
   if (lookup.state === 'absent' || !lookup.plan) {
     return { status: 409, body: { message: 'This subscription cannot be changed here.' } }
   }
-  // An empty platform id is a misconfiguration under which no plan could be told apart: refuse, never guess.
-  if (!platformSellerId || lookup.plan.seller_id === platformSellerId) {
+  // An empty platform id is a misconfiguration under which no plan could be told apart: refuse, never guess. A plan
+  // whose seller id is missing or empty is refused the same way: `subscription_plan.seller_id` is NOT NULL today, so
+  // this cannot happen, but "whose plan is it?" answered with nothing must never read as "a seller's" (Codex, #229).
+  const sellerId = lookup.plan.seller_id
+  if (!platformSellerId || typeof sellerId !== 'string' || !sellerId || sellerId === platformSellerId) {
     return {
       status: 409,
       body: { message: 'This is a Miyagi Sánchez plan. Manage it from your shop settings.', code: 'platform_plan' },
     }
   }
   return null
+}
+
+/**
+ * A subscription a payment processor bills (Stripe or Mercado Pago) is refused here: this route changes Medusa only,
+ * so "cancelled" here would leave the processor charging the buyer with nothing on our side to stop it (verifier,
+ * #229). Until a cancel flow that ends the billing exists, only subscriptions nobody bills automatically (SPEI) can be
+ * cancelled through this route. A row that carries any processor id is treated as billed, whatever its
+ * `payment_method` says.
+ */
+export function buyerProcessorRefusal(sub: {
+  payment_method?: unknown
+  stripe_subscription_id?: unknown
+  mp_preapproval_id?: unknown
+}): BuyerSubscriptionAnswer | null {
+  const hasId = (v: unknown) => typeof v === 'string' && v.length > 0
+  const billed =
+    hasId(sub.stripe_subscription_id) ||
+    hasId(sub.mp_preapproval_id) ||
+    sub.payment_method !== 'spei'
+  if (!billed) return null
+  return {
+    status: 409,
+    body: {
+      message: 'This subscription is billed by your payment provider. Cancel it from the link in your receipt.',
+      code: 'processor_billed',
+    },
+  }
 }
