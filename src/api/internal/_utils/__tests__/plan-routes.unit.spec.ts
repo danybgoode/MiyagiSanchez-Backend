@@ -2,7 +2,9 @@ import { POST as setupNegocio } from '../../setup-negocio-plan/route'
 import { POST as setupTienda } from '../../setup-tienda-plan/route'
 import * as negocioSubscription from '../../negocio-subscription/route'
 import * as tiendaSubscription from '../../tienda-subscription/route'
+import { ContainerRegistrationKeys } from '@medusajs/framework/utils'
 import { SUBSCRIPTIONS_MODULE } from '../../../../modules/subscriptions'
+import { statusWriteStatement } from '../../../../lib/plan-kind'
 
 /**
  * The HTTP shell of the two paid plans' internal routes. The decisions are specced in
@@ -13,7 +15,7 @@ const SECRET = 'plan-routes-secret'
 const NEG = { id: 'subplan_neg', seller_id: 'platform', stripe_price_id: 'price_neg', price_cents: 14900, metadata: { kind: 'negocio_plan' } }
 const TIE = { id: 'subplan_tie', seller_id: 'platform', stripe_price_id: 'price_tie', price_cents: 2900, metadata: { kind: 'tienda_plan' } }
 
-function harness(over: { secret?: string | null; body?: unknown; query?: unknown; plans?: any[]; brokenModule?: boolean } = {}) {
+function harness(over: { secret?: string | null; body?: unknown; query?: unknown; plans?: any[]; brokenModule?: boolean; noRows?: boolean } = {}) {
   const plans = over.plans ?? [NEG, TIE]
   const subscriptions = [
     { id: 'sub_n', plan_id: 'subplan_neg', clerk_user_id: 'user_1', seller_id: 'shop_1', status: 'active', stripe_subscription_id: 'stripe_n' },
@@ -27,7 +29,18 @@ function harness(over: { secret?: string | null; body?: unknown; query?: unknown
     createSubscriptionPlans: async (d: any) => { created.push(d); return { id: 'subplan_created', ...d } },
     updateSubscriptionPlans: async (d: any) => d,
     listSubscriptions: async (f: any) => subscriptions.filter((s) => match(s, f)),
-    updateSubscriptions: async (d: any) => { Object.assign(subscriptions.find((s) => s.id === d.id)!, d) },
+  }
+  // The shared Postgres connection. It runs the ONE statement the lapse write is allowed to be, with its condition.
+  const statements: Array<{ sql: string; bindings: string[] }> = []
+  const knex = {
+    raw: async (sql: string, bindings: string[]) => {
+      statements.push({ sql, bindings })
+      if (over.noRows) return {}
+      const [status, id, planId, final] = bindings
+      const row = subscriptions.find((s) => s.id === id && s.plan_id === planId && s.status !== final)
+      if (row) row.status = status
+      return { rows: row ? [{ id }] : [] }
+    },
   }
   const req: any = {
     headers: over.secret === null ? {} : { 'x-internal-secret': over.secret ?? SECRET },
@@ -37,7 +50,7 @@ function harness(over: { secret?: string | null; body?: unknown; query?: unknown
       resolve: (key: string) => {
         resolved.push(key)
         if (over.brokenModule) throw new Error('could not resolve the subscriptions module')
-        return module
+        return key === ContainerRegistrationKeys.PG_CONNECTION ? knex : module
       },
     },
   }
@@ -46,7 +59,7 @@ function harness(over: { secret?: string | null; body?: unknown; query?: unknown
     status(code: number) { out.status = code; return res },
     json(body: any) { out.body = body; return res },
   }
-  return { req, res, out, resolved, created, subscriptions }
+  return { req, res, out, resolved, created, subscriptions, statements }
 }
 
 describe('the paid plans\' internal routes', () => {
@@ -101,7 +114,21 @@ describe('the paid plans\' internal routes', () => {
   it('resolves the module once per request', async () => {
     const h = harness({ body: { stripe_subscription_id: 'stripe_t', status: 'canceled' } })
     await tiendaSubscription.PATCH(h.req, h.res)
-    expect(h.resolved).toEqual([SUBSCRIPTIONS_MODULE])
+    expect(h.resolved.filter((k) => k === SUBSCRIPTIONS_MODULE)).toHaveLength(1)
+  })
+
+  it('PATCH writes through the one conditional statement, on the shared connection', async () => {
+    const h = harness({ body: { stripe_subscription_id: 'stripe_t', status: 'unpaid' } })
+    await tiendaSubscription.PATCH(h.req, h.res)
+    expect(h.out.body).toEqual({ updated: 1 })
+    expect(h.statements).toEqual([statusWriteStatement({ id: 'sub_t', planId: 'subplan_tie', status: 'pending' })])
+    expect(h.subscriptions.map((s) => s.status)).toEqual(['active', 'pending'])
+  })
+
+  it('a driver answer with no `rows` is a failed write, never "handled"', async () => {
+    const h = harness({ body: { stripe_subscription_id: 'stripe_t', status: 'canceled' }, noRows: true })
+    await tiendaSubscription.PATCH(h.req, h.res)
+    expect(h.out.body).toEqual({ updated: 0 })
   })
 
   it('GET tienda-subscription answers the Tienda subscription, GET negocio-subscription the Negocio one', async () => {

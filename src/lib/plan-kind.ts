@@ -24,8 +24,88 @@
  */
 export const PLAN_LIVE_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due'])
 
-/** Statuses the lapse path (the Stripe webhook) may set. */
-export const PLAN_SETTABLE_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due', 'canceled'])
+/**
+ * What the lapse path stores for each status Stripe can report on a subscription. The keys are the statuses the
+ * PATCH accepts; anything else is a 400.
+ *
+ * The `subscription.status` column is a CHECK over six values (`pending`, `active`, `trialing`, `past_due`,
+ * `canceled`, `pending_confirmation`), so Stripe's other names cannot be stored as they are. They are not needed:
+ * what matters to a plan is live or not live, and final or not final.
+ *
+ *   - `unpaid`, `paused`, `incomplete` -> `pending`. NOT live: Stripe has stopped trying to collect (`unpaid`), the
+ *     merchant is not being billed (`paused`), or the first payment never completed (`incomplete`). Refusing these
+ *     (the old 400) left the row at its last live status, a plan nobody was paying for. Not final either: Stripe
+ *     moves `unpaid` and `paused` back to `active` when the invoice is paid or the pause ends, and that later
+ *     `active` must land.
+ *   - `incomplete_expired` -> `canceled`. Final in Stripe: the subscription can never be paid.
+ *
+ * Nothing here widens what is live: that is `PLAN_LIVE_STATUSES` and only that.
+ */
+export const PLAN_STORED_STATUS: Readonly<Record<string, 'active' | 'trialing' | 'past_due' | 'pending' | 'canceled'>> = {
+  active: 'active',
+  trialing: 'trialing',
+  past_due: 'past_due',
+  unpaid: 'pending',
+  paused: 'pending',
+  incomplete: 'pending',
+  canceled: 'canceled',
+  incomplete_expired: 'canceled',
+}
+
+/** Statuses the lapse path (the Stripe webhook) may send. */
+export const PLAN_SETTABLE_STATUSES: ReadonlySet<string> = new Set(Object.keys(PLAN_STORED_STATUS))
+
+/** The stored status for a status Stripe reported, or null for one this route does not know ("I cannot tell" is
+ *  never guessed into a status). Own keys only: `constructor` or `toString` is not a status. */
+export function storedStatusFor(reported: string): string | null {
+  return Object.prototype.hasOwnProperty.call(PLAN_STORED_STATUS, reported) ? PLAN_STORED_STATUS[reported] : null
+}
+
+/** The one FINAL stored status. A row that reaches it is never written again (see `statusWriteStatement`). */
+export const PLAN_FINAL_STATUS = 'canceled'
+
+/**
+ * The lapse write, as ONE conditional statement: set the status unless the row is already cancelled.
+ *
+ * `canceled` is final, but Stripe does not promise event order: an `updated` event (active / past_due / trialing)
+ * sent before the cancellation can be handled after it. Reading the row and then deciding is not enough — two
+ * requests can both read "live", the cancellation lands, and the stale write lands on top of it: a cancelled plan
+ * live again with nobody paying and no later event to end it. So the condition is in the UPDATE's own WHERE.
+ * Postgres re-checks it against the committed row after waiting for a concurrent writer, so whichever order the two
+ * requests run in, the row ends `canceled`.
+ *
+ * Raw SQL on purpose: Medusa's generated `update<Model>s({ selector, data })` LISTS the rows matching the selector
+ * and then updates them by id (`medusa-internal-service.js`), which is the same read-then-write. `plan_id` is in
+ * the WHERE so this statement can never touch another plan's row, and `returning id` is how the caller knows
+ * whether it wrote.
+ */
+export function statusWriteStatement(row: { id: string; planId: string; status: string }): { sql: string; bindings: string[] } {
+  return {
+    sql:
+      `update subscription set status = ?, updated_at = now()
+` +
+      ` where id = ? and plan_id = ? and deleted_at is null and status <> ?
+` +
+      ` returning id`,
+    bindings: [row.status, row.id, row.planId, PLAN_FINAL_STATUS],
+  }
+}
+
+/**
+ * What one row's lapse write amounted to, from the number of rows the conditional statement wrote and (when it wrote
+ * none) the row's status read back afterwards.
+ *
+ *   - `written`: the status is now what was asked.
+ *   - `final`: nothing was written because the row is cancelled — it already was, or a cancellation won the race.
+ *     HANDLED, and counted: the caller treats 0 as "no such subscription" and raises an alarm, and this row is in
+ *     the only state it can ever be in. Reading `canceled` after the fact is safe exactly because it is final.
+ *   - `failed`: nothing was written and the row is NOT cancelled (it is gone, or the read-back says something
+ *     else). Never counted: "I could not write and cannot say why" is not success.
+ */
+export function statusWriteOutcome(written: number, statusAfter: string | null | undefined): 'written' | 'final' | 'failed' {
+  if (written > 0) return 'written'
+  return statusAfter === PLAN_FINAL_STATUS ? 'final' : 'failed'
+}
 
 export type PlanLike = {
   id?: string
@@ -105,14 +185,17 @@ export type PlanStore = {
   createSubscriptionPlans(data: Record<string, unknown>): Promise<any>
   updateSubscriptionPlans(data: Record<string, unknown>): Promise<any>
   listSubscriptions(filters: Record<string, unknown>, config?: Record<string, unknown>): Promise<any[]>
-  /** ONE argument carrying the id. See the note in `setPlanSubscriptionStatus` before changing this shape. */
-  updateSubscriptions(data: { id: string } & Record<string, unknown>): Promise<any>
 }
 
 export type PlanDeps = {
   subs: PlanStore
   /** The `seller_id` every platform-owned plan is filed under. */
   platformSellerId: string
+  /**
+   * Runs `statusWriteStatement(row)` and answers how many rows it wrote (0 or 1). The ONLY way a subscription's
+   * status is written from here: there is deliberately no unconditional update on `PlanStore`.
+   */
+  writeStatusUnlessCanceled(row: { id: string; planId: string; status: string }): Promise<number>
   logError?: (message: string, error: unknown) => void
 }
 
@@ -248,10 +331,10 @@ export async function readPlanSubscription(
 /**
  * PATCH /internal/<kind>-subscription  { stripe_subscription_id, status }
  *
- * The lapse path. Answers `{ updated }` = the rows of THIS plan found for that Stripe id AND written successfully.
- * Re-setting the status a row already has (a replayed webhook) counts, on purpose, and so does a row that is already
- * `canceled` and is left that way (see the loop): 0 means the honest failure — no such row on this plan, or every
- * write failed.
+ * The lapse path. `status` is the status STRIPE reports (`PLAN_STORED_STATUS` lists them and what each is stored
+ * as). Answers `{ updated }` = the rows of THIS plan found for that Stripe id that are HANDLED: written, or already
+ * cancelled and left that way. Re-setting the status a row already has (a replayed webhook) counts, on purpose.
+ * 0 means the honest failure — no such row on this plan, or every write failed.
  */
 export async function setPlanSubscriptionStatus(
   spec: PlanKindSpec,
@@ -259,12 +342,13 @@ export async function setPlanSubscriptionStatus(
   deps: PlanDeps,
 ): Promise<RouteAnswer> {
   const stripeSubscriptionId = typeof input.stripe_subscription_id === 'string' ? input.stripe_subscription_id : ''
-  const status = typeof input.status === 'string' ? input.status : ''
-  if (!stripeSubscriptionId || !status) {
+  const reported = typeof input.status === 'string' ? input.status : ''
+  if (!stripeSubscriptionId || !reported) {
     return { status: 400, body: { message: 'stripe_subscription_id and status are required' } }
   }
-  if (!PLAN_SETTABLE_STATUSES.has(status)) {
-    return { status: 400, body: { message: `unsupported status: ${status}` } }
+  const status = storedStatusFor(reported)
+  if (!status) {
+    return { status: 400, body: { message: `unsupported status: ${reported}` } }
   }
 
   // No `.catch`: a failed read throws (a 500 the caller treats as a failure), never `updated: 0` ("no such row").
@@ -277,22 +361,23 @@ export async function setPlanSubscriptionStatus(
 
   let updated = 0
   for (const r of rows) {
-    // `canceled` is FINAL. Stripe ends a subscription once, but it does not promise event order: a late
-    // `customer.subscription.updated` (active / past_due / trialing) can arrive AFTER the deletion. Writing it would
-    // set a cancelled row live again — a paid plan nobody is paying for, with no later event to end it. So a
-    // cancelled row is never written. It is still COUNTED: the caller reads 0 as "no such subscription" and raises an
-    // alarm, and this row was found and is in the only state it can be in. (`canceled` over `canceled`, a replayed
-    // deletion, lands here too.) A new subscription for the same shop is a new Stripe id and a new row.
-    if (r.status === 'canceled') {
+    // Already cancelled: handled, nothing to write. This is only a shortcut — a row read as live here is still
+    // protected, because the write below carries the condition itself (see `statusWriteStatement`). A new
+    // subscription for the same shop is a new Stripe id and a new row, so "final" never blocks a re-subscription.
+    if (r.status === PLAN_FINAL_STATUS) {
       updated++
       continue
     }
     try {
-      // `{ id, ...fields }` in ONE argument, the shape Medusa's generated `update<Model>s` takes. The lapse routes
-      // of the older platform plans call `updateSubscriptions(id, { status })`; the generated method reads its
-      // second argument as the shared context and its first as the data, so that call never reaches the row.
-      // On a paid plan that is a cancelled subscription that stays live, so the shape is pinned in the spec.
-      await deps.subs.updateSubscriptions({ id: r.id, status })
+      const written = await deps.writeStatusUnlessCanceled({ id: r.id, planId: plan.id, status })
+      // Wrote nothing: read the row back to tell "a cancellation got there first" (handled) from "the row is
+      // gone" (a failure). Only a status read AFTER the write attempt can say which.
+      const after = written > 0 ? null : (await deps.subs.listSubscriptions({ id: r.id, plan_id: plan.id }, { take: 1 }))[0]
+      const outcome = statusWriteOutcome(written, after?.status)
+      if (outcome === 'failed') {
+        deps.logError?.(`[${spec.logTag}] status update failed for ${r.id}:`, new Error(`no row written; status is ${after?.status ?? 'unknown'}`))
+        continue
+      }
       updated++
     } catch (e) {
       deps.logError?.(`[${spec.logTag}] status update failed for ${r.id}:`, e)

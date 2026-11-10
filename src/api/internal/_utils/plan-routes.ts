@@ -9,6 +9,7 @@
  * secret). It runs BEFORE anything is read from the request or the database.
  */
 import { MedusaRequest, MedusaResponse } from '@medusajs/framework/http'
+import { ContainerRegistrationKeys } from '@medusajs/framework/utils'
 import { SUBSCRIPTIONS_MODULE } from '../../../modules/subscriptions'
 import { PLATFORM_SELLER_ID } from '../setup-custom-domain-plan/route'
 import { internalSecretOk } from '../../../lib/internal-auth'
@@ -16,6 +17,7 @@ import {
   readPlanSubscription,
   setPlanSubscriptionStatus,
   setupPlanOfKind,
+  statusWriteStatement,
   type PlanDeps,
   type PlanKindSpec,
   type PlanStore,
@@ -38,6 +40,15 @@ function handler(spec: PlanKindSpec, body: Body, input: (req: MedusaRequest) => 
         return (subs ??= req.scope.resolve(SUBSCRIPTIONS_MODULE))
       },
       platformSellerId: PLATFORM_SELLER_ID,
+      // The status write is one conditional SQL statement on the shared connection (the house pattern for a
+      // conditional write, e.g. `cancelPaymentLink`); `statusWriteStatement` says why it cannot go through the
+      // module's generated update. `returning id` gives the rows written.
+      writeStatusUnlessCanceled: async (row) => {
+        const { sql, bindings } = statusWriteStatement(row)
+        const result = await req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION).raw(sql, bindings)
+        // No `?? 0`: a driver answer without `rows` is not "wrote nothing" — let it throw and be logged as a failure.
+        return result.rows.length
+      },
       logError: (message, error) => console.error(message, error),
     }
     const answer = await body(spec, (input(req) ?? {}) as Record<string, unknown>, deps)

@@ -1,8 +1,14 @@
 import { NEGOCIO_PLAN_SPEC } from '../negocio-plan'
 import {
+  PLAN_LIVE_STATUSES,
+  PLAN_SETTABLE_STATUSES,
+  PLAN_STORED_STATUS,
   readPlanSubscription,
   setPlanSubscriptionStatus,
   setupPlanOfKind,
+  statusWriteOutcome,
+  statusWriteStatement,
+  storedStatusFor,
   type PlanDeps,
   type PlanKindSpec,
   type PlanStore,
@@ -21,7 +27,7 @@ type Row = Record<string, any>
 function makeStore(seed: { plans?: Row[]; subscriptions?: Row[] } = {}, opts: { leaky?: boolean } = {}) {
   const plans: Row[] = (seed.plans ?? []).map((p) => ({ ...p }))
   const subscriptions: Row[] = (seed.subscriptions ?? []).map((s) => ({ ...s }))
-  const calls = { createPlan: 0, updatePlan: [] as Row[], updateSub: [] as Array<{ id: string; data: Row }> }
+  const calls = { createPlan: 0, updatePlan: [] as Row[], updateSub: [] as Array<{ id: string; data: Row }>, writeAttempts: [] as Row[] }
   let n = 0
   const match = (row: Row, filters: Row) => Object.entries(filters).every(([k, v]) => row[k] === v)
   const subs: PlanStore = {
@@ -43,17 +49,21 @@ function makeStore(seed: { plans?: Row[]; subscriptions?: Row[] } = {}, opts: { 
       const used = opts.leaky ? rest : filters
       return subscriptions.filter((s) => match(s, used)).map((s) => ({ ...s }))
     },
-    // Like the real generated method: ONE argument, the row found by its `id`. A call in the old
-    // `(id, { status })` shape carries no id here and throws, as it fails to reach the row in Medusa.
-    updateSubscriptions: async (data, ...rest: unknown[]) => {
-      if (rest.length > 0 || typeof data?.id !== 'string') throw new Error('Subscription with id "" not found')
-      const { id, ...fields } = data
-      calls.updateSub.push({ id, data: fields })
-      Object.assign(subscriptions.find((s) => s.id === id)!, fields)
-      return {}
+  }
+  const deps: PlanDeps = {
+    subs,
+    platformSellerId: 'platform',
+    // The conditional statement, against the store's CURRENT rows (not a snapshot some caller read earlier):
+    // write unless the row is cancelled, and answer the rows written.
+    writeStatusUnlessCanceled: async ({ id, planId, status }) => {
+      calls.writeAttempts.push({ id, planId, status })
+      const row = subscriptions.find((r) => r.id === id && r.plan_id === planId && r.status !== 'canceled')
+      if (!row) return 0
+      calls.updateSub.push({ id, data: { status } })
+      row.status = status
+      return 1
     },
   }
-  const deps: PlanDeps = { subs, platformSellerId: 'platform' }
   return { deps, plans, subscriptions, calls }
 }
 
@@ -311,7 +321,7 @@ describe('setPlanSubscriptionStatus — Plan Tienda', () => {
     const s = makeStore({ plans: [TIE], subscriptions: [sub('a', TIE, { stripe_subscription_id: 'sub_X' }), sub('b', TIE, { stripe_subscription_id: 'sub_X' })] })
     const logged: string[] = []
     s.deps.logError = (m) => logged.push(m)
-    s.deps.subs.updateSubscriptions = async ({ id }) => { if (id === 'a') throw new Error('write failed'); return {} }
+    s.deps.writeStatusUnlessCanceled = async ({ id }) => { if (id === 'a') throw new Error('write failed'); return 1 }
     const a = await setPlanSubscriptionStatus(TIENDA_PLAN_SPEC, { stripe_subscription_id: 'sub_X', status: 'past_due' }, s.deps)
     expect(a.body.updated).toBe(1)
     expect(logged).toEqual(['[tienda-subscription] status update failed for a:'])
@@ -364,5 +374,169 @@ describe.each(BOTH)('setPlanSubscriptionStatus — %s: canceled is final', (_nam
     const a = await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'sub_X', status: 'active' }, s.deps)
     expect(a.body.updated).toBe(2)
     expect(s.subscriptions.map((r) => r.status)).toEqual(['canceled', 'active'])
+  })
+})
+
+/**
+ * The guard above is only safe if it is in the WRITE. Two requests can both read the row as live; the cancellation
+ * lands; the stale write follows. A check made on the row as it was READ lets that write through.
+ */
+describe.each(BOTH)('setPlanSubscriptionStatus — %s: a cancellation cannot be overtaken', (_name, spec, own) => {
+  /** The row is live when this request READS it, and cancelled by another request before this one WRITES. */
+  function overtaken() {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own, { status: 'active' })] })
+    const list = s.deps.subs.listSubscriptions
+    let first = true
+    s.deps.subs.listSubscriptions = async (f, c) => {
+      const rows = await list(f, c)
+      if (first) { first = false; s.subscriptions[0].status = 'canceled' }
+      return rows
+    }
+    return s
+  }
+
+  it.each(['active', 'past_due', 'trialing', 'unpaid'])('a stale %s that read the row live changes nothing once the cancellation has landed', async (late) => {
+    const s = overtaken()
+    const a = await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status: late }, s.deps)
+    expect(s.subscriptions[0].status).toBe('canceled')
+    // It did try (it had read a live row), and the statement refused.
+    expect(s.calls.writeAttempts).toHaveLength(1)
+    expect(s.calls.updateSub).toEqual([])
+    // Lost the race to a cancellation = handled: counted, so the caller raises no false alarm.
+    expect(a).toEqual({ status: 200, body: { updated: 1 } })
+  })
+
+  it('the write is scoped to this plan\'s row and carries the stored status', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own)] })
+    await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status: 'past_due' }, s.deps)
+    expect(s.calls.writeAttempts).toEqual([{ id: 'a', planId: own.id, status: 'past_due' }])
+  })
+
+  it('nothing written and the row is NOT cancelled (it is gone): a failure, not counted, and logged', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own)] })
+    const logged: string[] = []
+    s.deps.logError = (m, e) => logged.push(`${m} ${(e as Error).message}`)
+    s.deps.writeStatusUnlessCanceled = async () => { s.subscriptions.length = 0; return 0 }
+    const a = await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status: 'canceled' }, s.deps)
+    expect(a.body.updated).toBe(0)
+    expect(logged).toEqual([`[${spec.logTag}] status update failed for a: no row written; status is unknown`])
+  })
+
+  it('nothing written and the row still reads live: a failure, never counted as handled', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own)] })
+    s.deps.writeStatusUnlessCanceled = async () => 0
+    expect((await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status: 'canceled' }, s.deps)).body.updated).toBe(0)
+  })
+
+  it('a failed read-back after an empty write is a failure, not counted', async () => {
+    const s = overtaken()
+    const list = s.deps.subs.listSubscriptions
+    s.deps.subs.listSubscriptions = async (f, c) => { if ('id' in f) throw new Error('db down'); return list(f, c) }
+    expect((await setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status: 'active' }, s.deps)).body.updated).toBe(0)
+  })
+})
+
+describe('statusWriteStatement — one conditional statement', () => {
+  it('sets the status only where the row is this plan\'s, not deleted and not already canceled', () => {
+    expect(statusWriteStatement({ id: 'sub_1', planId: 'subplan_tie', status: 'active' })).toEqual({
+      sql:
+        'update subscription set status = ?, updated_at = now()\n' +
+        ' where id = ? and plan_id = ? and deleted_at is null and status <> ?\n' +
+        ' returning id',
+      bindings: ['active', 'sub_1', 'subplan_tie', 'canceled'],
+    })
+  })
+})
+
+describe('statusWriteOutcome', () => {
+  it('a written row is written, whatever was read', () => {
+    expect(statusWriteOutcome(1, undefined)).toBe('written')
+    expect(statusWriteOutcome(1, 'canceled')).toBe('written')
+  })
+
+  it('nothing written + the row is canceled = final (handled)', () => {
+    expect(statusWriteOutcome(0, 'canceled')).toBe('final')
+  })
+
+  it('nothing written + anything else = failed: unknown is never "handled"', () => {
+    for (const after of ['active', 'pending', 'past_due', '', null, undefined]) {
+      expect(statusWriteOutcome(0, after)).toBe('failed')
+    }
+  })
+})
+
+/**
+ * Stripe reports more statuses than the plan has. Refusing one (a 400) leaves the row at its last LIVE status: a
+ * plan nobody is paying for.
+ */
+describe('the statuses Stripe can report', () => {
+  it('live is exactly active, trialing and past_due', () => {
+    expect([...PLAN_LIVE_STATUSES].sort()).toEqual(['active', 'past_due', 'trialing'])
+  })
+
+  it('maps each one to a status the column can store', () => {
+    expect(PLAN_STORED_STATUS).toEqual({
+      active: 'active', trialing: 'trialing', past_due: 'past_due',
+      unpaid: 'pending', paused: 'pending', incomplete: 'pending',
+      canceled: 'canceled', incomplete_expired: 'canceled',
+    })
+    // The `subscription.status` CHECK constraint (Migration20260527035421): anything else fails the write.
+    const column = ['pending', 'active', 'trialing', 'past_due', 'canceled', 'pending_confirmation']
+    for (const stored of Object.values(PLAN_STORED_STATUS)) expect(column).toContain(stored)
+    expect([...PLAN_SETTABLE_STATUSES].sort()).toEqual(Object.keys(PLAN_STORED_STATUS).sort())
+  })
+
+  it('every status that is not live in Stripe is stored as one that is not live here', () => {
+    for (const reported of ['unpaid', 'paused', 'incomplete', 'incomplete_expired', 'canceled']) {
+      expect(PLAN_LIVE_STATUSES.has(storedStatusFor(reported)!)).toBe(false)
+    }
+    for (const reported of ['active', 'trialing', 'past_due']) expect(storedStatusFor(reported)).toBe(reported)
+  })
+
+  it('an unknown status is null, never guessed: not a stored-only name, not an inherited key', () => {
+    for (const reported of ['pending', 'pending_confirmation', 'free_forever', '', 'constructor', 'toString', '__proto__']) {
+      expect(storedStatusFor(reported)).toBeNull()
+    }
+  })
+})
+
+describe.each(BOTH)('setPlanSubscriptionStatus — %s: every unpaid status ends the plan', (_name, spec, own) => {
+  const q = { seller_clerk_id: 'user_1', shop_id: 'shop_1' }
+  const live = async (s: ReturnType<typeof makeStore>) => (await readPlanSubscription(spec, q, s.deps)).body.active
+  const set = (s: ReturnType<typeof makeStore>, status: string) =>
+    setPlanSubscriptionStatus(spec, { stripe_subscription_id: 'stripe_a', status }, s.deps)
+
+  it.each(['unpaid', 'paused', 'incomplete'])('%s is persisted as pending and the plan is no longer live', async (reported) => {
+    for (const from of ['active', 'past_due', 'trialing']) {
+      const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own, { status: from })] })
+      expect(await live(s)).toBe(true)
+      expect(await set(s, reported)).toEqual({ status: 200, body: { updated: 1 } })
+      expect(s.subscriptions[0].status).toBe('pending')
+      expect(await live(s)).toBe(false)
+    }
+  })
+
+  it.each(['unpaid', 'paused', 'incomplete'])('%s is not final: the plan is live again when Stripe says active', async (reported) => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own)] })
+    await set(s, reported)
+    expect(await set(s, 'active')).toEqual({ status: 200, body: { updated: 1 } })
+    expect(s.subscriptions[0].status).toBe('active')
+    expect(await live(s)).toBe(true)
+  })
+
+  it('incomplete_expired is persisted as canceled, and is final', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own, { status: 'pending' })] })
+    expect((await set(s, 'incomplete_expired')).body.updated).toBe(1)
+    expect(s.subscriptions[0].status).toBe('canceled')
+    expect((await set(s, 'active')).body.updated).toBe(1)
+    expect(s.subscriptions[0].status).toBe('canceled')
+    expect(await live(s)).toBe(false)
+  })
+
+  it('a stored-only name is still refused: pending is not a status Stripe sends', async () => {
+    const s = makeStore({ plans: [NEG, TIE], subscriptions: [sub('a', own)] })
+    expect((await set(s, 'pending')).status).toBe(400)
+    expect((await set(s, 'pending_confirmation')).status).toBe(400)
+    expect(s.subscriptions[0].status).toBe('active')
   })
 })
