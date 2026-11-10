@@ -33,6 +33,7 @@ import { SUBSCRIPTIONS_MODULE } from '../../../modules/subscriptions'
 import type SubscriptionsModuleService from '../../../modules/subscriptions/service'
 import { PLATFORM_SELLER_ID } from '../setup-custom-domain-plan/route'
 import { SUBDOMAIN_PLAN_KIND } from '../setup-subdomain-plan/route'
+import { platformSkuStatusHandler } from '../_utils/plan-routes'
 
 // `past_due` counts as live: it's a grace window while Stripe retries the card —
 // the subdomain stays white-label so a transient payment failure never collapses
@@ -91,35 +92,11 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   }
 }
 
-const SETTABLE_STATUSES = new Set([
-  'active',
-  'trialing',
-  'past_due',
-  'canceled',
-])
-
-export async function PATCH(req: MedusaRequest, res: MedusaResponse) {
-  const secret = req.headers['x-internal-secret']
-  if (!secret || secret !== process.env.MEDUSA_INTERNAL_SECRET) {
-    return res.status(401).json({ message: 'Unauthorized' })
-  }
-
-  const body = (req.body ?? {}) as { stripe_subscription_id?: string; status?: string }
-  if (!body.stripe_subscription_id || !body.status) {
-    return res.status(400).json({ message: 'stripe_subscription_id and status are required' })
-  }
-  if (!SETTABLE_STATUSES.has(body.status)) {
-    return res.status(400).json({ message: `unsupported status: ${body.status}` })
-  }
-
-  const subs = req.scope.resolve(SUBSCRIPTIONS_MODULE) as SubscriptionsModuleService
-  const rows: any[] = await (subs as any)
-    .listSubscriptions({ stripe_subscription_id: body.stripe_subscription_id }, { take: 50 })
-    .catch(() => [])
-
-  for (const r of rows) {
-    await (subs as any).updateSubscriptions(r.id, { status: body.status }).catch(() => {})
-  }
-
-  return res.json({ updated: rows.length })
-}
+// The lapse path. Its write is the shared conditional statement (`setPlatformSkuSubscriptionStatus`,
+// `src/lib/plan-kind.ts`): it lands, and it never moves a row out of `canceled`. Until 2026-11 this called
+// `updateSubscriptions(r.id, { status })` — the id as the data argument — so no status sent here was ever written.
+export const PATCH = platformSkuStatusHandler({
+  kind: SUBDOMAIN_PLAN_KIND,
+  label: 'subdominio',
+  logTag: 'subdomain-subscription',
+})

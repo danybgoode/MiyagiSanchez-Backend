@@ -76,13 +76,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   } catch { /* non-fatal */ }
 
   if (existing.length > 0) {
-    // Update status if it changed
-    const sub = existing[0]
-    if (body.status && sub.status !== body.status) {
-      try {
-        await (subsService as any).updateSubscriptions(sub.id, { status: body.status })
-      } catch { /* non-fatal */ }
-    }
+    // A replay (Stripe re-delivered the checkout event) records nothing new and changes NO status.
+    //
+    // This branch used to "update status if it changed" with `updateSubscriptions(sub.id, { status })` — the id
+    // as the data argument — so that write never landed, and removing it changes nothing that runs today. It was
+    // removed rather than repaired because, live, it would be wrong:
+    //   - Every caller (the Storefront's checkout-completed handlers) sends `status: 'active'`. A replayed or late
+    //     checkout event is OLDER than whatever happened since, so writing its `active` over a newer `past_due` or
+    //     `canceled` would revive a lapsed or cancelled subscription: a paid plan nobody pays for.
+    //   - The status of an existing row is owned by the lapse routes (`/internal/*-subscription` PATCH), which
+    //     write it from the subscription's own Stripe events through the conditional statement in
+    //     `src/lib/plan-kind.ts`. A second writer here would be a second, unguarded source of truth.
+    // The answer is unchanged: the row as it is, `created: false`.
     return res.json({ subscription: existing[0], created: false })
   }
 

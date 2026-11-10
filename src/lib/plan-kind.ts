@@ -359,6 +359,24 @@ export async function setPlanSubscriptionStatus(
   const rows = (await deps.subs.listSubscriptions({ stripe_subscription_id: stripeSubscriptionId, plan_id: plan.id }, { take: 50 }))
     .filter((r: any) => r?.plan_id === plan.id)
 
+  const updated = await applyStatusToRows(rows, status, deps, spec.logTag)
+  return { status: 200, body: { updated } }
+}
+
+/**
+ * Apply ONE stored status to each row through the conditional statement, and count the rows that are HANDLED:
+ * written, or already cancelled and left that way. Each row is written under its OWN `plan_id`, which the caller
+ * has already checked belongs to the plan (or plans) it is allowed to touch.
+ *
+ * Shared by every platform plan's lapse path (`setPlanSubscriptionStatus` and `setPlatformSkuSubscriptionStatus`),
+ * so the canceled-is-final rule and the read-back counting cannot drift between them.
+ */
+export async function applyStatusToRows(
+  rows: ReadonlyArray<{ id: string; plan_id: string; status?: string | null }>,
+  status: string,
+  deps: PlanDeps,
+  logTag: string,
+): Promise<number> {
   let updated = 0
   for (const r of rows) {
     // Already cancelled: handled, nothing to write. This is only a shortcut — a row read as live here is still
@@ -369,19 +387,73 @@ export async function setPlanSubscriptionStatus(
       continue
     }
     try {
-      const written = await deps.writeStatusUnlessCanceled({ id: r.id, planId: plan.id, status })
+      const written = await deps.writeStatusUnlessCanceled({ id: r.id, planId: r.plan_id, status })
       // Wrote nothing: read the row back to tell "a cancellation got there first" (handled) from "the row is
       // gone" (a failure). Only a status read AFTER the write attempt can say which.
-      const after = written > 0 ? null : (await deps.subs.listSubscriptions({ id: r.id, plan_id: plan.id }, { take: 1 }))[0]
+      const after = written > 0 ? null : (await deps.subs.listSubscriptions({ id: r.id, plan_id: r.plan_id }, { take: 1 }))[0]
       const outcome = statusWriteOutcome(written, after?.status)
       if (outcome === 'failed') {
-        deps.logError?.(`[${spec.logTag}] status update failed for ${r.id}:`, new Error(`no row written; status is ${after?.status ?? 'unknown'}`))
+        deps.logError?.(`[${logTag}] status update failed for ${r.id}:`, new Error(`no row written; status is ${after?.status ?? 'unknown'}`))
         continue
       }
       updated++
     } catch (e) {
-      deps.logError?.(`[${spec.logTag}] status update failed for ${r.id}:`, e)
+      deps.logError?.(`[${logTag}] status update failed for ${r.id}:`, e)
     }
   }
+  return updated
+}
+
+// ── The older platform SKUs: custom domain, subdomain, ML sync ───────────────────────────────────────────────────
+
+/** What names one of the older platform SKUs (custom domain, subdomain, ML sync): its plan kind, and log names. */
+export type PlatformSkuSpec = Pick<PlanKindSpec, 'kind' | 'label' | 'logTag'>
+
+/**
+ * The statuses the older SKUs' lapse routes accept. Narrower than `PLAN_SETTABLE_STATUSES` on purpose: the
+ * Storefront's webhook maps Stripe's status to one of these four BEFORE it calls (`unpaid` is sent as `past_due`),
+ * so these routes never receive `unpaid`, `paused` or `incomplete*`, and widening what they accept is a contract
+ * change nobody asked for. All four are stored as they are.
+ */
+export const PLATFORM_SKU_SETTABLE_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due', 'canceled'])
+
+/**
+ * PATCH /internal/{custom-domain,subdomain,ml-sync}-subscription  { stripe_subscription_id, status }
+ *
+ * The lapse path for the older platform SKUs. These routes called the module's generated update as
+ * `updateSubscriptions(id, { status })` — the id as the data and the patch as the context — so no status they were
+ * sent was ever written (two of them swallowed the error). The write now goes through `applyStatusToRows`, the same
+ * conditional statement as Plan Negocio and Plan Tienda: making dead writes live without that guard would let a
+ * late `updated` event revive a cancelled subscription.
+ *
+ * Contract kept: same body, same accepted statuses, `{ updated }`. What changed, beyond the write landing:
+ *   - `updated` counts the rows HANDLED (written, or already cancelled), not the rows found. 0 is the honest failure.
+ *   - Only rows on a plan of THIS SKU's kind are touched. Every plan of the kind counts (not just the oldest), so a
+ *     duplicate seed can never leave a paying row unreachable by its lapse.
+ *   - A failed read throws (a 500 the caller logs) instead of reading as "no rows"; no plan of the kind is a 409.
+ */
+export async function setPlatformSkuSubscriptionStatus(
+  spec: PlatformSkuSpec,
+  input: { stripe_subscription_id?: unknown; status?: unknown },
+  deps: PlanDeps,
+): Promise<RouteAnswer> {
+  const stripeSubscriptionId = typeof input.stripe_subscription_id === 'string' ? input.stripe_subscription_id : ''
+  const status = typeof input.status === 'string' ? input.status : ''
+  if (!stripeSubscriptionId || !status) {
+    return { status: 400, body: { message: 'stripe_subscription_id and status are required' } }
+  }
+  if (!PLATFORM_SKU_SETTABLE_STATUSES.has(status)) {
+    return { status: 400, body: { message: `unsupported status: ${status}` } }
+  }
+
+  const planIds = new Set(plansOfKind(await listPlatformPlans(deps), spec.kind).map((p: any) => p?.id).filter(Boolean))
+  if (planIds.size === 0) return { status: 409, body: { message: `${spec.label} plan is not seeded` } }
+
+  // Read by the Stripe id (as before), then keep only this SKU's rows: the custom-domain route must never lapse an
+  // ML-sync row that happens to be looked up by the same id, nor the reverse.
+  const rows = (await deps.subs.listSubscriptions({ stripe_subscription_id: stripeSubscriptionId }, { take: 50 }))
+    .filter((r: any) => typeof r?.plan_id === 'string' && planIds.has(r.plan_id))
+
+  const updated = await applyStatusToRows(rows, status, deps, spec.logTag)
   return { status: 200, body: { updated } }
 }
