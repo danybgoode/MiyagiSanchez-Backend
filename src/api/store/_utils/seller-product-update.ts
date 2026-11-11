@@ -1017,14 +1017,18 @@ export async function updateSellerProduct(
     if (variant) {
       const locationId = inventoryLocationForWrite!
       if (locationId) {
-        if (!variant.manage_inventory) {
-          await (productService as any).updateProductVariants(variant.id, { manage_inventory: true })
-          // A listing that first gets seats (an event created before this existed) was
-          // never provisioned at create: link its channels to the stock location now, or
-          // reserveInventoryStep fails at checkout with "sales channel not associated".
+        // An event listing (created before seats existed, or half-provisioned by a failed
+        // earlier attempt) may have channels not linked to the stock location; without the
+        // link reserveInventoryStep fails at checkout with "sales channel not associated".
+        // The link is idempotent, so it runs on EVERY event seat write, before the flip: a
+        // retry after a partial failure repairs it instead of skipping it (codex review #230).
+        if (listingType !== 'product') {
           for (const ch of (product?.sales_channels ?? []) as Array<{ id?: string }>) {
             if (ch?.id) await ensureSalesChannelLocationLink(scope, ch.id, locationId)
           }
+        }
+        if (!variant.manage_inventory) {
+          await (productService as any).updateProductVariants(variant.id, { manage_inventory: true })
         }
         await setVariantAvailableQuantity(scope, variant, locationId, body.quantity)
         // Propagate a manual stock edit to a linked ML item (US-10) so ML never

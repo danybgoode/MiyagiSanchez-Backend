@@ -172,6 +172,13 @@ describe('updateSellerProduct — an event listing first gets seats', () => {
     expect(writes.find((w) => w.kind === 'set-available')?.input).toEqual({ variantId: 'variant_ev', locationId: 'sloc_mx', quantity: 25 })
   })
 
+  it('a retry on an already-managed event still links its channels (repairs a partial first attempt)', async () => {
+    const result = await updateSellerProduct(updateScope(eventProduct(true)), 'prod_ev', { quantity: 10 }, seller as any)
+    expect(result.ok).toBe(true)
+    expect(writes.filter((w) => w.kind === 'link-channel').map((w) => w.input.channelId)).toEqual(['sc_a', 'sc_b'])
+    expect(writes.some((w) => w.kind === 'update-variant')).toBe(false)
+  })
+
   it('a negative Cupo on update is refused and nothing is written', async () => {
     const result = await updateSellerProduct(updateScope(eventProduct(true)), 'prod_ev', { quantity: -1 }, seller as any)
     expect(result).toMatchObject({ ok: false, status: 422, message: expect.stringMatching(/negativos/) })
