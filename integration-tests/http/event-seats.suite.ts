@@ -28,6 +28,18 @@ export function eventSeatsSuite(getContainer: () => any) {
     let channelId: string
     let marketplaceId: string
 
+    // These four are process-wide: save them once and restore after every test, so the
+    // money-path suite that runs after this one never inherits an event fixture's ids (codex review #230).
+    const ENV_KEYS = ['MEDUSA_MXN_REGION_ID', 'MEDUSA_MX_OPERATING_CHANNEL_ID', 'MEDUSA_SALES_CHANNEL_ID', 'MEDUSA_STOCK_LOCATION_ID'] as const
+    const savedEnv: Record<string, string | undefined> = {}
+    beforeAll(() => { for (const k of ENV_KEYS) savedEnv[k] = process.env[k] })
+    afterEach(() => {
+      for (const k of ENV_KEYS) {
+        if (savedEnv[k] === undefined) delete process.env[k]
+        else process.env[k] = savedEnv[k]
+      }
+    })
+
     beforeEach(async () => {
       const container = getContainer()
       const { result: [region] } = await createRegionsWorkflow(container).run({
