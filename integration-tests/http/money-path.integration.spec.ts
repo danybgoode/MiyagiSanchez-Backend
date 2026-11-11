@@ -33,6 +33,7 @@ import {
 } from '@medusajs/framework/utils'
 
 import { inPersonSaleSuite } from './in-person-sale.suite'
+import { eventSeatsSuite } from './event-seats.suite'
 
 jest.setTimeout(180_000)
 
@@ -40,6 +41,8 @@ medusaIntegrationTestRunner({
   testSuite: ({ api, getContainer }) => {
     // in-person-sales S1.2 — mounted here, not as its own runner file (see the suite's header).
     inPersonSaleSuite(getContainer, api)
+    // merchant-panel-gaps S1.1 — event seats are tracked inventory the engine enforces.
+    eventSeatsSuite(getContainer)
 
     describe('money path — a publishable key buys exactly what it should', () => {
       let regionId: string

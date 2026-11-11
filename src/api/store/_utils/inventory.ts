@@ -27,12 +27,42 @@ import {
 
 type Scope = { resolve: (key: string) => any }
 
-/** Listing types that represent a stockable physical good. */
-export function isStockableListingType(listingType: string | null | undefined): boolean {
-  // Only physical `product` listings are unique-stock items (covers autos/inmuebles,
-  // which are products with category metadata). service/rental/digital/subscription
-  // have no finite stock.
-  return (listingType ?? 'product') === 'product'
+/** True when the listing's attrs carry the event block (a date or a venue). */
+export function hasEventBlock(attrs: Record<string, unknown> | null | undefined): boolean {
+  if (!attrs || typeof attrs !== 'object') return false
+  const filled = (v: unknown) => typeof v === 'string' && v.trim().length > 0
+  return filled(attrs.event_date) || filled(attrs.venue_name)
+}
+
+/**
+ * The ONE stock predicate — create, update and the backfill all ask it.
+ *
+ * Physical `product` listings are unique-stock items (covers autos/inmuebles,
+ * which are products with category metadata). A `service` or `digital` listing is
+ * stockable only as an EVENT: it carries the event block AND the caller provided
+ * a quantity ("Lugares disponibles"). Without a quantity an event stays unmanaged,
+ * exactly as before, so no existing listing changes behaviour.
+ */
+export function isStockableListingType(
+  listingType: string | null | undefined,
+  event?: { attrs?: Record<string, unknown> | null; quantity?: number | null },
+): boolean {
+  const type = listingType ?? 'product'
+  if (type === 'product') return true
+  if (type !== 'service' && type !== 'digital') return false
+  return hasEventBlock(event?.attrs) && event?.quantity != null
+}
+
+/**
+ * Seats are an AVAILABLE count, so only a negative or non-numeric value is
+ * refused (D2: lowering below tickets sold cannot happen by construction —
+ * stocked = available + reserved). Pure, so it is unit-tested without Medusa.
+ */
+export function validateSeatQuantity(quantity: unknown): { ok: true } | { ok: false; message: string } {
+  if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity < 0) {
+    return { ok: false, message: 'Los lugares disponibles no pueden ser negativos.' }
+  }
+  return { ok: true }
 }
 
 /**

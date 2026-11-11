@@ -21,6 +21,8 @@ import {
 } from '@medusajs/medusa/core-flows'
 import {
   isStockableListingType,
+  validateSeatQuantity,
+  ensureSalesChannelLocationLink,
   resolveStockLocationId,
   setVariantAvailableQuantity,
   getProductAvailableQuantity,
@@ -983,11 +985,17 @@ export async function updateSellerProduct(
       fields: [
         'metadata', 'type.value',
         'variants.id', 'variants.sku', 'variants.title', 'variants.manage_inventory',
+        'sales_channels.id',
       ],
       filters: { id },
     })
     const product = rows?.[0] as any
     const listingType = product?.type?.value ?? (product?.metadata?.listing_type as string | undefined) ?? 'product'
+    // An event's block can arrive in this same request or already sit on the listing.
+    const eventAttrs = {
+      ...((product?.metadata?.attrs as Record<string, unknown> | undefined) ?? {}),
+      ...(body.attrs ?? {}),
+    }
     const variants: any[] = product?.variants ?? []
     const variant = (body.variant_id
       ? variants.find((v) => v.id === body.variant_id)
@@ -995,8 +1003,13 @@ export async function updateSellerProduct(
       | { id: string; sku?: string | null; title?: string | null; manage_inventory?: boolean }
       | undefined
 
-    if (!isStockableListingType(listingType)) {
+    // ONE predicate with create: physical products, or an event (block + quantity).
+    if (!isStockableListingType(listingType, { attrs: eventAttrs, quantity: body.quantity })) {
       return { ok: false, status: 422, message: 'Only physical products can have a stock quantity' }
+    }
+    if (listingType !== 'product') {
+      const seats = validateSeatQuantity(body.quantity)
+      if (!seats.ok) return { ok: false, status: 422, message: seats.message }
     }
     if (!variant && variants.length > 1) {
       return { ok: false, status: 422, message: 'Este producto tiene varias variantes; especifica variant_id.' }
@@ -1006,6 +1019,12 @@ export async function updateSellerProduct(
       if (locationId) {
         if (!variant.manage_inventory) {
           await (productService as any).updateProductVariants(variant.id, { manage_inventory: true })
+          // A listing that first gets seats (an event created before this existed) was
+          // never provisioned at create: link its channels to the stock location now, or
+          // reserveInventoryStep fails at checkout with "sales channel not associated".
+          for (const ch of (product?.sales_channels ?? []) as Array<{ id?: string }>) {
+            if (ch?.id) await ensureSalesChannelLocationLink(scope, ch.id, locationId)
+          }
         }
         await setVariantAvailableQuantity(scope, variant, locationId, body.quantity)
         // Propagate a manual stock edit to a linked ML item (US-10) so ML never

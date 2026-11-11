@@ -17,6 +17,7 @@ import { createProductsWorkflow, updateProductsWorkflow } from '@medusajs/medusa
 import { SELLER_MODULE } from '../../../modules/seller'
 import {
   isStockableListingType,
+  validateSeatQuantity,
   resolveStockLocationId,
   provisionVariantInventory,
 } from './inventory'
@@ -336,7 +337,15 @@ export async function createSellerProduct(
   // Managed variants let Medusa's completeCartWorkflow reserve stock on order
   // placement and block double-selling. service/rental/digital/subscription are
   // not stockable. Default quantity 1 (unique P2P item).
-  const manageInventory = isStockableListingType(body.listing_type)
+  const manageInventory = isStockableListingType(body.listing_type, {
+    attrs: body.attrs,
+    quantity: body.quantity,
+  })
+  if (manageInventory && (body.listing_type ?? 'product') !== 'product') {
+    // An event's seats: a negative count is refused, never silently clamped to 0.
+    const seats = validateSeatQuantity(body.quantity)
+    if (!seats.ok) return { ok: false, status: 422, message: seats.message }
+  }
   const quantity = Math.max(0, Math.floor(body.quantity ?? 1))
   const inventoryLocationId = manageInventory
     ? await resolveStockLocationId(scope, sellerMarket)
