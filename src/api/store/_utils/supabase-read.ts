@@ -2,10 +2,14 @@
  * Read-only Supabase client for GCP-hosted personalization reads.
  *
  * Boundary note (AGENTS rule #2): Supabase owns the non-commerce marketplace data
- * (favorites / offers / conversations) and the FRONTEND owns all WRITES to it. This
- * client is READ-ONLY except for one narrow flag-serving resilience RPC — the marketplace-static-shell epic moved the homepage's
- * personalization read onto Cloud Run, so the backend reads (never writes) that data
- * here, with the frontend's service-role key. Supabase stays the source of truth.
+ * (favorites / offers / conversations) and the FRONTEND owns almost all WRITES to it.
+ * This client READS that data (the marketplace-static-shell epic moved the homepage's
+ * personalization read onto Cloud Run) and makes exactly these writes, all with the
+ * frontend's service-role key:
+ *   - one flag-serving resilience RPC;
+ *   - start-checkout's offer reservation (lib/offer-checkout.ts): a conditional update of
+ *     `marketplace_offers.checkout_reserved_at` to claim, release or keep an accepted offer.
+ * It never writes an offer's status or amount. Supabase stays the source of truth.
  *
  * Lazy singleton + missing-config stub mirror the frontend `lib/supabase.ts`, so a
  * build/runtime without the env vars degrades to "no rows" instead of crashing.

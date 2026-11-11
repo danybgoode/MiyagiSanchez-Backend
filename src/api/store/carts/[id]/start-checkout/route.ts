@@ -32,7 +32,7 @@ import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } f
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
-import { claimOfferForCheckout, releaseOfferClaim, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
+import { OFFER_SESSION_TTL_MS, claimOfferForCheckout, keepOfferReserved, releaseOfferClaim, supabaseOfferKeep, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
 import { checkFulfillmentMethod, sellerShippingInput } from '../../../../../lib/fulfillment-method-guard'
 import { correosGate } from '../../../../../lib/correos-gate'
 import { checkItemAmount } from '../../../../../lib/zero-amount-guard'
@@ -627,6 +627,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     body.coupon_code = undefined
   }
 
+  // Set when this request reserved an accepted offer (S1.3); used to keep it reserved for a manual order.
+  let offerReservation: { offerId: string; reservedAt: string } | null = null
+
   // ── Negotiated price must be a REAL accepted offer ────────────────────────
   // `offer_amount_cents` used to be charged as sent. It is now honoured only when
   // `offer_id` names an accepted, unexpired offer for THIS cart's single listing at
@@ -658,6 +661,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       // Any refusal or error after this point, before a payment session is returned, frees the
       // offer again. A 2xx means a session exists and the reservation stays until it goes stale.
       const claimedOfferId = decision.offerId
+      offerReservation = { offerId: claimedOfferId, reservedAt: claimed.reservedAt }
       res.on('finish', () => {
         if (res.statusCode >= 400) {
           void releaseOfferClaim(claimedOfferId, claimed.reservedAt, supabaseOfferRelease(supabaseRead as any))
@@ -955,7 +959,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const checkoutTotalCents = priceCents + shippingCents
 
   // Refuse a $0 item charge, judged on the FINAL amount after offer/support/rental/coupon/bundle.
-  const zero = checkItemAmount(priceCents, serverCartSource)
+  const zero = checkItemAmount(priceCents, serverCartSource, couponDiscountCents, rawItemsCents - bundleDiscountCents)
   if (!zero.ok) return res.status(zero.status).json({ message: zero.message, code: zero.code })
 
   // ── Escrow mode is resolved early so it can be written to cart metadata before the payment branch
@@ -1226,7 +1230,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     const session = await stripeClient.checkout.sessions.create({
       mode: 'payment',
       // D8: just over Stripe's 30-minute minimum (see COUNTER_CHECKOUT_TTL_MS).
-      ...(serverCartSource ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) } : {}),
+      // An offer checkout gets a short session too (OFFER_SESSION_TTL_MS), so its reservation can expire.
+      ...(serverCartSource ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) }
+        : offerReservation ? { expires_at: Math.floor((Date.now() + OFFER_SESSION_TTL_MS) / 1000) } : {}),
       line_items: lineItems,
       // MX: transfer_data + application_fee_amount (destination charge, platform context).
       // US: empty — a direct charge carries no transfer and no application fee; the
@@ -1363,6 +1369,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       ...(serverCartSource ? {
         expires: true,
         expiration_date_to: new Date(Date.now() + COUNTER_CHECKOUT_TTL_MS).toISOString(),
+      } : offerReservation ? {
+        expires: true,
+        expiration_date_to: new Date(Date.now() + OFFER_SESSION_TTL_MS).toISOString(),
       } : {}),
       metadata: {
         cart_id: cartId,
@@ -1546,6 +1555,12 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         const closed = closedRefusal(now_ ? derivePaymentLinkState(now_, new Date()) : 'cancelled')
         return res.status(closed?.status ?? 410).json({ code: closed?.code ?? 'LINK_CLOSED', message: closed?.message ?? 'Este cobro ya no está disponible.' })
       }
+    }
+
+    // A manual offer order has no session to expire, so its reservation must not go stale and
+    // let a second checkout re-open the offer. Stripe/MP offers keep the short reservation.
+    if (isManual && offerReservation) {
+      await keepOfferReserved(offerReservation.offerId, offerReservation.reservedAt, supabaseOfferKeep(supabaseRead as any))
     }
 
     const responseBody: Record<string, unknown> = {

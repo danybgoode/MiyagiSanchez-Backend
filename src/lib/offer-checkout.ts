@@ -153,8 +153,18 @@ export function supabaseOfferLookup(supabase: {
 // checkout_session_id / checkout_expires_at are written at accept time for the offer's own pay
 // link and drive the 24h payment window, so they cannot carry a short reservation.
 
-export const OFFER_RESERVATION_STALE_MS = 30 * 60 * 1000
-export const OFFER_IN_CHECKOUT_MESSAGE = 'Esta oferta ya tiene un pago abierto.'
+/**
+ * An offer's payment session lives 31 minutes: Stripe refuses an `expires_at` under 30 minutes
+ * from when IT receives the request, so exactly 30 would fail on network latency (same reason
+ * as COUNTER_CHECKOUT_TTL_MS in start-checkout). The reservation outlives the session by 5
+ * minutes, so a reservation can never be reclaimed while its own session could still be paid.
+ */
+export const OFFER_SESSION_TTL_MS = 31 * 60 * 1000
+export const OFFER_RESERVATION_STALE_MS = OFFER_SESSION_TTL_MS + 5 * 60 * 1000
+export const OFFER_IN_CHECKOUT_MESSAGE =
+  `Ya tienes un pago abierto para esta oferta. Termínalo o inténtalo de nuevo en ${Math.round(OFFER_RESERVATION_STALE_MS / 60000)} minutos.`
+/** A manual-payment offer order has no session to expire: the reservation is kept far in the future. */
+export const OFFER_RESERVATION_PERMANENT_ISO = '9999-12-31T00:00:00.000Z'
 
 /** Resolves true when this caller won the reservation. A THROW = the claim could not be made. */
 export type OfferClaim = (offerId: string, nowIso: string, staleBeforeIso: string) => Promise<boolean>
@@ -191,6 +201,33 @@ export async function releaseOfferClaim(
   } catch (e) {
     log(`[offer-checkout] release of offer ${offerId} failed: ${e instanceof Error ? e.message : String(e)}`)
     return false
+  }
+}
+
+/** After a MANUAL offer order exists: the reservation never goes stale. Best-effort, logged. */
+export async function keepOfferReserved(
+  offerId: string,
+  reservedAt: string,
+  keep: (offerId: string, reservedAtIso: string, permanentIso: string) => Promise<void>,
+  log: (msg: string) => void = (m) => console.error(m),
+): Promise<boolean> {
+  try {
+    await keep(offerId, reservedAt, OFFER_RESERVATION_PERMANENT_ISO)
+    return true
+  } catch (e) {
+    log(`[offer-checkout] could not keep offer ${offerId} reserved: ${e instanceof Error ? e.message : String(e)}`)
+    return false
+  }
+}
+
+export function supabaseOfferKeep(supabase: { from: (t: string) => any }) {
+  return async (offerId: string, reservedAtIso: string, permanentIso: string) => {
+    const { error } = await supabase
+      .from('marketplace_offers')
+      .update({ checkout_reserved_at: permanentIso })
+      .eq('id', offerId)
+      .eq('checkout_reserved_at', reservedAtIso)
+    if (error) throw new Error(error.message ?? 'offer keep failed')
   }
 }
 

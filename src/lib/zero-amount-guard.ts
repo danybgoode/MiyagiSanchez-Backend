@@ -13,14 +13,19 @@
  * server's claim lookup (`serverCartSource`), never a body field.
  */
 export const ZERO_AMOUNT_MESSAGE = 'Este anuncio no tiene un precio para cobrar.'
+export const COUPON_ZERO_MESSAGE = 'Este cupón deja el total en $0 y no se puede cobrar.'
 
 export function checkItemAmount(
   finalItemCents: number,
   serverCartSource: 'in_person' | 'payment_link' | null,
+  /** What the coupon took off. When the item amount BEFORE it was positive, the coupon caused the $0. */
+  couponDiscountCents = 0,
+  amountBeforeCouponCents = 0,
 ): { ok: true } | { ok: false; status: 422; code: 'ZERO_AMOUNT'; message: string } {
   if (serverCartSource) return { ok: true }
   if (!Number.isFinite(finalItemCents) || finalItemCents <= 0) {
-    return { ok: false, status: 422, code: 'ZERO_AMOUNT', message: ZERO_AMOUNT_MESSAGE }
+    const byCoupon = couponDiscountCents > 0 && amountBeforeCouponCents > 0
+    return { ok: false, status: 422, code: 'ZERO_AMOUNT', message: byCoupon ? COUPON_ZERO_MESSAGE : ZERO_AMOUNT_MESSAGE }
   }
   return { ok: true }
 }
