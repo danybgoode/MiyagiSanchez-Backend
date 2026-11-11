@@ -13,7 +13,7 @@
  * files in one jest process break each other — see in-person-sale.suite.ts).
  */
 import { ContainerRegistrationKeys, Modules } from '@medusajs/framework/utils'
-import { addToCartWorkflow, createCartWorkflow, createRegionsWorkflow } from '@medusajs/medusa/core-flows'
+import { addToCartWorkflow, completeCartWorkflow, createCartWorkflow, listShippingOptionsForCartWorkflow, createPaymentCollectionForCartWorkflow, createRegionsWorkflow } from '@medusajs/medusa/core-flows'
 import { SELLER_MODULE } from '../../src/modules/seller'
 import { setupFulfillmentInfrastructure } from '../../src/api/store/_utils/fulfillment'
 import { createSellerProduct } from '../../src/api/store/_utils/seller-product-create'
@@ -43,7 +43,7 @@ export function eventSeatsSuite(getContainer: () => any) {
     beforeEach(async () => {
       const container = getContainer()
       const { result: [region] } = await createRegionsWorkflow(container).run({
-        input: { regions: [{ name: 'México seats', currency_code: 'mxn', countries: ['mx'] }] },
+        input: { regions: [{ name: 'México seats', currency_code: 'mxn', countries: ['mx'], payment_providers: ['pp_cash_cash'] }] },
       })
       regionId = region.id
       const [operating, marketplace] = await container.resolve(Modules.SALES_CHANNEL)
@@ -119,6 +119,88 @@ export function eventSeatsSuite(getContainer: () => any) {
       expect(view.available).toBe(2)                    // → ticketQuantityCap({ available: 2 }) === 2
       expect(await tryAdd(container, view.variants[0].id, 3)).toBe('refused')
       expect(await tryAdd(container, view.variants[0].id, 2)).toBe('added')
+    })
+
+    // resolveDefaultShippingProfileId caches the profile id at MODULE level, and other suites in this
+    // process create their own default profile first — so a product made here can end up with no
+    // profile the cart's options match. Link it to the profile the options are built on, which is
+    // what production has (one default profile, options + products both on it).
+    async function optionForProduct(container: any, cartId: string, productId: string): Promise<string> {
+      const opts = (await listShippingOptionsForCartWorkflow(container).run({ input: { cart_id: cartId } })).result as any[]
+      const option = opts.find((o) => o.name === 'miyagi-entrega-digital')
+      const knex = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+      await knex.raw(
+        'update product_shipping_profile set shipping_profile_id = ? where product_id = ? and deleted_at is null',
+        [option.shipping_profile_id, productId],
+      )
+      return option.id
+    }
+
+    // Reserve-at-COMPLETION is where the engine actually takes the seats: adding to a cart
+    // reserves nothing. Same shape as the in-person suite's payCart (cash provider).
+    async function buy(container: any, productId: string, variantId: string, quantity: number): Promise<'completed' | string> {
+      const { result: cart } = await createCartWorkflow(container).run({
+        input: { region_id: regionId, sales_channel_id: channelId, currency_code: 'mxn', shipping_address: { country_code: 'mx', first_name: 'A', last_name: 'B', address_1: 'x', city: 'x', postal_code: '1' } as any },
+      })
+      try {
+        await addToCartWorkflow(container).run({ input: { cart_id: cart.id, items: [{ variant_id: variantId, quantity }] } })
+        await container.resolve(Modules.CART).addShippingMethods(cart.id, [{
+          name: 'Entregado en persona', amount: 0,
+          shipping_option_id: await optionForProduct(container, cart.id, productId), data: {},
+        }])
+        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cart.id } })
+        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+          provider_id: 'pp_cash_cash', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+        })
+        await completeCartWorkflow(container).run({ input: { id: cart.id } })
+        return 'completed'
+      } catch (e) {
+        return `refused: ${(e as Error).message}`
+      }
+    }
+
+    it('Cupo 2, buyer A completes 2 tickets: buyer B cannot add or complete even 1 (cross-buyer oversell)', async () => {
+      const container = getContainer()
+      const created = await createSellerProduct(container, sellerId, {
+        title: 'Cupo compartido', listing_type: 'service', price_cents: 15000, quantity: 2, attrs: EVENT,
+      })
+      const productId = (created as { product_id: string }).product_id
+      const variantId = (await productView(container, productId)).variants[0].id
+
+      expect(await buy(container, productId, variantId, 2)).toBe('completed')
+      const after = await productView(container, productId)
+      expect(after.available).toBe(0)                   // the 2 seats are now reserved/sold
+      expect(await tryAdd(container, variantId, 1)).toBe('refused')
+      expect(await buy(container, productId, variantId, 1)).toMatch(/^refused: .*required inventory/)
+    })
+
+    it('a refused seat edit writes nothing: a negative quantity alongside a new title leaves the title alone', async () => {
+      const container = getContainer()
+      const created = await createSellerProduct(container, sellerId, {
+        title: 'Titulo original', listing_type: 'service', price_cents: 15000, quantity: 3, attrs: EVENT,
+      })
+      const productId = (created as { product_id: string }).product_id
+      const sellers: any = container.resolve(SELLER_MODULE)
+      const [seller] = await sellers.listSellers({ id: sellerId })
+      const r = await updateSellerProduct(container, productId, { title: 'Titulo nuevo', quantity: -3 }, seller)
+      expect(r).toMatchObject({ ok: false, status: 422 })
+      const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({ entity: 'product', fields: ['title'], filters: { id: productId } })
+      expect((data[0] as any).title).toBe('Titulo original')
+      expect((await productView(container, productId)).available).toBe(3)
+    })
+
+    it('a quantity on a non-event service is refused before its new title is written', async () => {
+      const container = getContainer()
+      const created = await createSellerProduct(container, sellerId, {
+        title: 'Servicio plano', listing_type: 'service', price_cents: 15000,
+      })
+      const productId = (created as { product_id: string }).product_id
+      const sellers: any = container.resolve(SELLER_MODULE)
+      const [seller] = await sellers.listSellers({ id: sellerId })
+      const r = await updateSellerProduct(container, productId, { title: 'Cambiado', quantity: 5 }, seller)
+      expect(r).toMatchObject({ ok: false, status: 422 })
+      const { data } = await container.resolve(ContainerRegistrationKeys.QUERY).graph({ entity: 'product', fields: ['title'], filters: { id: productId } })
+      expect((data[0] as any).title).toBe('Servicio plano')
     })
 
     it('an event with NO Cupo stays untracked (today\'s behaviour is unchanged)', async () => {
