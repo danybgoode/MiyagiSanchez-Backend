@@ -84,6 +84,10 @@ export async function resolveOfferCheckout(
 
   if (offer.status !== 'accepted') return invalid()
 
+  // A NULL checkout_expires_at is legitimate, not a gap: the storefront leaves it null when the seller
+  // has no Stripe account to open a payment window on (apps/storefront/lib/offer-respond.ts:298 initialises
+  // `checkoutExpires = null` and sets it only inside the Stripe-enabled branch, ~line 328). Such an offer
+  // has no payment deadline to enforce here, so we do not refuse it.
   if (offer.checkout_expires_at) {
     const exp = Date.parse(offer.checkout_expires_at)
     if (!Number.isFinite(exp) || exp <= input.now.getTime()) return invalid()
@@ -99,10 +103,13 @@ export async function resolveOfferCheckout(
   const agreed = agreedAmountCents(offer)
   if (agreed === null || agreed !== amount) return invalid()
 
-  // Buyer identity: a verified Clerk caller must be the offer's buyer; otherwise the buyer's
-  // email must match. A mismatching Clerk id is never rescued by an email.
-  if (offer.buyer_clerk_user_id && input.clerkUserId) {
-    if (offer.buyer_clerk_user_id !== input.clerkUserId) return invalid()
+  // Buyer identity. An offer made by a signed-in buyer (buyer_clerk_user_id set) can be paid ONLY by
+  // that same VERIFIED Clerk id — there is no email fallback, because an email is not proof of
+  // identity (the cart email and body buyer_email are caller-supplied). Email matching is allowed
+  // solely for guest offers, which have no buyer_clerk_user_id. `input.clerkUserId` comes from
+  // extractClerkUserId(req), which reads only the token the middleware verified against Clerk's JWKS.
+  if (offer.buyer_clerk_user_id) {
+    if (!input.clerkUserId || offer.buyer_clerk_user_id !== input.clerkUserId) return invalid()
   } else {
     const want = (offer.buyer_email ?? '').trim().toLowerCase()
     const known = input.buyerEmails.map((e) => (e ?? '').trim().toLowerCase()).filter(Boolean)
