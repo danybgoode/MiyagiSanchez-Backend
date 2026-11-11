@@ -144,3 +144,78 @@ export function supabaseOfferLookup(supabase: {
     }
   }
 }
+
+// ── One accepted offer opens ONE checkout at a time ─────────────────────────────────────
+// resolveOfferCheckout only READS, so two tabs (or two scripts) could each open a discounted
+// checkout on one accepted offer. validate (above) → CLAIM (here) → apply (the payment session).
+// The claim is a conditional write read back with `.select()` — a read followed by a write is
+// a lost update waiting to happen. It uses its OWN column, `checkout_reserved_at`: the existing
+// checkout_session_id / checkout_expires_at are written at accept time for the offer's own pay
+// link and drive the 24h payment window, so they cannot carry a short reservation.
+
+export const OFFER_RESERVATION_STALE_MS = 30 * 60 * 1000
+export const OFFER_IN_CHECKOUT_MESSAGE = 'Esta oferta ya tiene un pago abierto.'
+
+/** Resolves true when this caller won the reservation. A THROW = the claim could not be made. */
+export type OfferClaim = (offerId: string, nowIso: string, staleBeforeIso: string) => Promise<boolean>
+export type OfferRelease = (offerId: string, reservedAtIso: string) => Promise<void>
+
+export type OfferClaimDecision =
+  | { ok: true; reservedAt: string }
+  | { ok: false; status: 409 | 503; code: 'OFFER_IN_CHECKOUT' | 'OFFER_UNAVAILABLE'; message: string }
+
+export async function claimOfferForCheckout(offerId: string, now: Date, claim: OfferClaim): Promise<OfferClaimDecision> {
+  const nowIso = now.toISOString()
+  const staleBeforeIso = new Date(now.getTime() - OFFER_RESERVATION_STALE_MS).toISOString()
+  let won: boolean
+  try {
+    won = await claim(offerId, nowIso, staleBeforeIso)
+  } catch {
+    // Could not claim is NOT "free to pay": never let a checkout through unclaimed.
+    return { ok: false, status: 503, code: 'OFFER_UNAVAILABLE', message: OFFER_UNAVAILABLE_MESSAGE }
+  }
+  if (!won) return { ok: false, status: 409, code: 'OFFER_IN_CHECKOUT', message: OFFER_IN_CHECKOUT_MESSAGE }
+  return { ok: true, reservedAt: nowIso }
+}
+
+/** Best-effort: a failed release only means the 30-minute stale window frees the offer instead. */
+export async function releaseOfferClaim(
+  offerId: string,
+  reservedAt: string,
+  release: OfferRelease,
+  log: (msg: string) => void = (m) => console.error(m),
+): Promise<boolean> {
+  try {
+    await release(offerId, reservedAt)
+    return true
+  } catch (e) {
+    log(`[offer-checkout] release of offer ${offerId} failed: ${e instanceof Error ? e.message : String(e)}`)
+    return false
+  }
+}
+
+export function supabaseOfferClaim(supabase: { from: (t: string) => any }): OfferClaim {
+  return async (offerId, nowIso, staleBeforeIso) => {
+    const { data, error } = await supabase
+      .from('marketplace_offers')
+      .update({ checkout_reserved_at: nowIso })
+      .eq('id', offerId)
+      .eq('status', 'accepted')
+      .or(`checkout_reserved_at.is.null,checkout_reserved_at.lt.${staleBeforeIso}`)
+      .select('id')
+    if (error) throw new Error(error.message ?? 'offer claim failed')
+    return Array.isArray(data) && data.length > 0
+  }
+}
+
+export function supabaseOfferRelease(supabase: { from: (t: string) => any }): OfferRelease {
+  return async (offerId, reservedAtIso) => {
+    // Only OUR reservation: if a later checkout reclaimed a stale one, its timestamp differs.
+    const { error } = await supabase
+      .from('marketplace_offers')
+      .update({ checkout_reserved_at: null })
+      .eq('id', offerId)
+      .eq('checkout_reserved_at', reservedAtIso)
+    if (error) throw new Error(error.message ?? 'offer release failed')
+  }
+}

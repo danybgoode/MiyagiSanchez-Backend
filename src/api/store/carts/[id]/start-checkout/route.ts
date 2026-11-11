@@ -32,7 +32,7 @@ import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } f
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
-import { resolveOfferCheckout, supabaseOfferLookup } from '../../../../../lib/offer-checkout'
+import { claimOfferForCheckout, releaseOfferClaim, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
 import { checkItemAmount } from '../../../../../lib/zero-amount-guard'
 import { checkShippingQuote, shippingQuoteKey } from '../../../../../lib/shipping-quote-signature'
 import { supabaseRead } from '../../../_utils/supabase-read'
@@ -648,6 +648,20 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     body.offer_amount_cents = decision.amountCents
     // A bare offer_id with no amount is not proof of anything — do not stamp it on the order.
     if (decision.amountCents === undefined) body.offer_id = undefined
+
+    // CLAIM (validate → claim → apply): one accepted offer opens one checkout at a time.
+    if (decision.amountCents !== undefined && decision.offerId) {
+      const claimed = await claimOfferForCheckout(decision.offerId, new Date(), supabaseOfferClaim(supabaseRead as any))
+      if (!claimed.ok) return res.status(claimed.status).json({ code: claimed.code, message: claimed.message })
+      // Any refusal or error after this point, before a payment session is returned, frees the
+      // offer again. A 2xx means a session exists and the reservation stays until it goes stale.
+      const claimedOfferId = decision.offerId
+      res.on('finish', () => {
+        if (res.statusCode >= 400) {
+          void releaseOfferClaim(claimedOfferId, claimed.reservedAt, supabaseOfferRelease(supabaseRead as any))
+        }
+      })
+    }
   }
 
   const item = cart.items[0] as any
