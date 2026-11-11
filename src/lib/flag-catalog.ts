@@ -75,6 +75,7 @@ const FLAG_CATALOG_DEFINITIONS = {
     description:
       'Tarifa económica de Correos de México en el checkout. Actívala para ofrecer esta opción de envío económico; apagada, esta tarifa nunca aparece (independiente de Envía).',
     owners: [
+      'src/api/store/carts/[id]/start-checkout/route.ts',
       'src/api/store/envia/rates/route.ts',
       'src/api/store/sellers/[slug]/checkout-options/route.ts',
     ],

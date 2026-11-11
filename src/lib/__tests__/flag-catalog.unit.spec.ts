@@ -108,7 +108,9 @@ describe('Medusa flag inventory', () => {
     // directions) — both registered in flag-catalog.ts's owners array above.
     // business-infrastructure D12: +1 on ops.profit_enabled — the internal ledger read for the monthly check-in
     // (src/api/internal/profit/ledger/route.ts), registered in the same owners array.
-    expect(callsites).toHaveLength(36)
+    // checkout-trust-hardening: +1 on shipping.correos_enabled — start-checkout re-derives the delivery
+    // methods the buyer was offered (lib/fulfillment-method-guard.ts), registered in the owners array.
+    expect(callsites).toHaveLength(37)
     const validation = validateBackendFlagCallsiteInventory(callsites)
     expect(validation).toEqual({ ok: true })
   })
