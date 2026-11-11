@@ -66,8 +66,10 @@ describe('resolveOfferCheckout', () => {
     refused(await run(input({ clerkUserId: 'user_2', buyerEmails: ['ana@example.com'] }))))
   it('refuses an unverified caller on an offer made by a signed-in buyer, even with the right email', async () =>
     refused(await run(input({ clerkUserId: null, buyerEmails: ['ana@example.com'] }))))
-  it('matches an anonymous caller by email, case-insensitively', async () => {
-    const r = await run(input({ clerkUserId: null, buyerEmails: [undefined, 'ana@example.com'] }), offer({ buyer_clerk_user_id: null }))
+  it('refuses an offer with no buyer_clerk_user_id, even with a matching email (no email path; codex #231)', async () =>
+    refused(await run(input({ clerkUserId: null, buyerEmails: [undefined, 'ana@example.com'] }), offer({ buyer_clerk_user_id: null }))))
+  it('resolves the cart product from variant.product_id when product_id is absent', async () => {
+    const r = await run(input({ cartItems: [{ variant: { product_id: 'prod_1' }, quantity: 1 }] as any }))
     expect(r.ok).toBe(true)
   })
   it('refuses an anonymous caller with no matching email', async () => {

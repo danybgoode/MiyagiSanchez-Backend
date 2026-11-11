@@ -42,7 +42,7 @@ export type OfferLookup = (offerId: string) => Promise<OfferRecord | null>
 export type OfferCheckoutInput = {
   offerAmountCents: unknown
   offerId: unknown
-  cartItems: Array<{ product_id?: string | null; quantity?: number | null }>
+  cartItems: Array<{ product_id?: string | null; variant?: { product_id?: string | null } | null; quantity?: number | null }>
   /** Verified Clerk id of the caller, if any. */
   clerkUserId: string | null
   /** Every email the request knows for the buyer (cart email, body buyer_email, verified token email). */
@@ -98,22 +98,20 @@ export async function resolveOfferCheckout(
   if (items.length !== 1) return invalid()
   const qty = Number(items[0].quantity ?? 1)
   if (qty !== 1) return invalid()
-  if (!offer.listing_medusa_product_id || items[0].product_id !== offer.listing_medusa_product_id) return invalid()
+  // Same resolution the route uses for the charged item (`item.product_id ?? item.variant?.product_id`).
+  const cartProductId = items[0].product_id ?? items[0].variant?.product_id ?? null
+  if (!offer.listing_medusa_product_id || cartProductId !== offer.listing_medusa_product_id) return invalid()
 
   const agreed = agreedAmountCents(offer)
   if (agreed === null || agreed !== amount) return invalid()
 
-  // Buyer identity. An offer made by a signed-in buyer (buyer_clerk_user_id set) can be paid ONLY by
-  // that same VERIFIED Clerk id — there is no email fallback, because an email is not proof of
-  // identity (the cart email and body buyer_email are caller-supplied). Email matching is allowed
-  // solely for guest offers, which have no buyer_clerk_user_id. `input.clerkUserId` comes from
-  // extractClerkUserId(req), which reads only the token the middleware verified against Clerk's JWKS.
-  if (offer.buyer_clerk_user_id) {
-    if (!input.clerkUserId || offer.buyer_clerk_user_id !== input.clerkUserId) return invalid()
-  } else {
-    const want = (offer.buyer_email ?? '').trim().toLowerCase()
-    const known = input.buyerEmails.map((e) => (e ?? '').trim().toLowerCase()).filter(Boolean)
-    if (!want || !known.includes(want)) return invalid()
+  // Buyer identity: ONLY the same VERIFIED Clerk id that made the offer. There is no email path at all —
+  // the cart email and body buyer_email are caller-supplied, so an email proves nothing (codex, PR #231).
+  // Every offer is made by a signed-in buyer (storefront app/api/offers/route.ts requires currentUser());
+  // live, 0 of 3 offers had no buyer_clerk_user_id (2026-11-11), so an offer without one is refused.
+  // `input.clerkUserId` comes from extractClerkUserId(req): the token the middleware verified against JWKS.
+  if (!offer.buyer_clerk_user_id || !input.clerkUserId || offer.buyer_clerk_user_id !== input.clerkUserId) {
+    return invalid()
   }
 
   return { ok: true, amountCents: agreed, offerId: offer.id }
