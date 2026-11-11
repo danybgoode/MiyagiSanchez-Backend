@@ -33,6 +33,8 @@ import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/co
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
 import { claimOfferForCheckout, releaseOfferClaim, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
+import { checkFulfillmentMethod, sellerShippingInput } from '../../../../../lib/fulfillment-method-guard'
+import { correosGate } from '../../../../../lib/correos-gate'
 import { checkItemAmount } from '../../../../../lib/zero-amount-guard'
 import { checkShippingQuote, shippingQuoteKey } from '../../../../../lib/shipping-quote-signature'
 import { supabaseRead } from '../../../_utils/supabase-read'
@@ -856,6 +858,39 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const fulfillmentMethod = supportCheckout ? 'digital' : (body.fulfillment_method ?? 'none')
   if (fulfillmentMethod === 'shipping' && !shippingQuote) {
     return res.status(400).json({ message: 'Selecciona una tarifa de envío para continuar.' })
+  }
+
+  // The delivery method must be one this listing + seller really offer (the same builder that
+  // makes the buyer's choices). Support carts are 'digital' by construction and server-built
+  // carts set their own method above, so neither is checked against the body.
+  if (!supportCheckout && !serverCartSource) {
+    const guardIds = Array.from(new Set(
+      (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id).filter(Boolean),
+    )) as string[]
+    const guardRows = guardIds.length ? await loadProductsForCheckout(remoteQuery as any, guardIds) : []
+    const hydrated = guardIds.length > 0 && (guardRows as any[]).length >= guardIds.length
+    const correosEligible = !correosGate({
+      correosEnabled: await isEnabled('shipping.correos_enabled'),
+      sellerOptIn: (((sellerSettings.shipping ?? {}) as any).correos_enabled) === true,
+    }).blocked
+    const methodDecision = checkFulfillmentMethod({
+      method: fulfillmentMethod,
+      products: hydrated
+        ? (guardRows as any[]).map((p) => {
+            const meta = (p?.metadata ?? {}) as Record<string, unknown>
+            return {
+              listingType: ((p?.type?.value as string | undefined) ?? (meta.listing_type as string | undefined) ?? 'product'),
+              deliveryMode: meta.delivery_mode === 'arranged' ? 'arranged' as const : 'carrier' as const,
+            }
+          })
+        : null,
+      seller: sellerShippingInput(sellerMeta, correosEligible),
+      arrangedOnlyEnabled: await isEnabled('shipping.arranged_only_enabled'),
+      market: readSellerOperatingMarket(seller).market === 'us' ? 'us' : 'mx',
+    })
+    if (!methodDecision.ok) {
+      return res.status(methodDecision.status).json({ message: methodDecision.message, code: methodDecision.code })
+    }
   }
 
   // ── US delivery admission (D16) ───────────────────────────────────────────
