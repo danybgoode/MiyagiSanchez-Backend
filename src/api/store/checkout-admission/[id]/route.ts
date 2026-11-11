@@ -24,8 +24,16 @@
  *       "status": "published",
  *       "in_operating_channel": true,
  *       "in_marketplace_channel": false
- *     }
+ *     },
+ *     "seller": { "slug": "mi-tienda" }  // the owning shop — see below
  *   }
+ *
+ * `seller.slug` names the shop that owns an ADMITTED product, so the storefront can
+ * read it through that shop's own channel (`/store/sellers/:slug/products/:id`) when
+ * the marketplace does not carry it — a «Solo mi tienda» product's checkout page.
+ * Medusa owns that edge (seller ↔ product link); the storefront must not resolve it
+ * from a Supabase mirror. It is only sent with an admission, and an admitted product
+ * is already public on that shop's page, so it reveals nothing a refusal hides.
  *
  * `medusa_product_id` duplicates `id` because the caller's admission proof compares
  * BOTH against the id it asked about — the productId/variantId divergence lesson in
@@ -108,9 +116,16 @@ type OwnerMarketRead =
       readonly market: MarketCode | null
       /** The owner's lifecycle status; `null` when unreadable, which REFUSES. */
       readonly sellerStatus: SellerStatus | null
+      /** The owner's public shop slug — echoed only alongside an admission. */
+      readonly sellerSlug: string | null
     }
   | { readonly status: 'absent' }
   | { readonly status: 'unavailable'; readonly reason: string }
+
+function readSellerSlug(seller: unknown): string | null {
+  const slug = (seller as { slug?: unknown }).slug
+  return typeof slug === 'string' && slug.length > 0 ? slug : null
+}
 
 async function ownerMarketFor(
   query: { graph: (args: any) => Promise<any> },
@@ -123,7 +138,8 @@ async function ownerMarketFor(
       // never echoed — the bag also carries Stripe Connect ids and payout config.
       // `seller.status` rides along on the query that already runs — the owner row is
       // being read anyway, so the money-path status proof costs nothing extra.
-      fields: ['id', 'seller.id', 'seller.metadata', 'seller.status'],
+      // `seller.slug` is public (it is the shop's URL) and echoed only on admission.
+      fields: ['id', 'seller.id', 'seller.slug', 'seller.metadata', 'seller.status'],
       filters: { id: productId },
     })
     const seller = (data?.[0] as { seller?: unknown } | undefined)?.seller
@@ -134,6 +150,7 @@ async function ownerMarketFor(
       // STRICT: an absent `status` here can only mean the field list above stopped
       // selecting it, and defaulting that to active would re-open every paused shop.
       sellerStatus: requireSellerStatus((seller as { status?: unknown }).status),
+      sellerSlug: readSellerSlug(seller),
     }
   } catch (e) {
     // THREE STATES, NEVER TWO. This used to `return null`, which the decision below
@@ -232,5 +249,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       in_operating_channel: decision.in_operating_channel,
       in_marketplace_channel: decision.in_marketplace_channel,
     },
+    // Admitted ⇒ the owner read resolved (an absent/unavailable owner never admits).
+    seller: { slug: ownerRead.status === 'resolved' ? ownerRead.sellerSlug : null },
   })
 }

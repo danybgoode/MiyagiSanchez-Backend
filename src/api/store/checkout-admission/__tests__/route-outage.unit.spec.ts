@@ -77,3 +77,73 @@ describe('checkout-admission route — an ownership-read outage is 503, not 404'
     expect(out.body.message).not.toMatch(/not found/i)
   })
 })
+
+/**
+ * The storefront's checkout page reads a «Solo mi tienda» product through its shop's
+ * own channel, and needs the OWNING shop to do it. Medusa owns that edge, so the
+ * admission answer carries it (reported live 2026-11-11: such products 404'd at
+ * checkout). Echoed only on admission — a refusal stays the uniform 404.
+ */
+function scopeWithOwner(seller: Record<string, unknown> | null) {
+  return {
+    resolve: () => ({
+      graph: async (args: any) => {
+        const fields: string[] = args.fields ?? []
+        if (fields.some((f) => f.startsWith('seller.'))) {
+          // Like the real graph: only the SELECTED seller fields come back, so a
+          // route that stops selecting `seller.slug` cannot pass this spec.
+          const selected = fields.filter((f) => f.startsWith('seller.')).map((f) => f.slice('seller.'.length))
+          const projected = seller
+            ? Object.fromEntries(Object.entries(seller).filter(([k]) => selected.includes(k)))
+            : null
+          return { data: [{ id: 'prod_1', seller: projected }] }
+        }
+        return {
+          data: [{
+            id: 'prod_1',
+            status: 'published',
+            metadata: {},
+            sales_channels: [{ id: OPERATING }],
+          }],
+        }
+      },
+    }),
+  }
+}
+
+describe('checkout-admission route — an admitted product names its owning shop', () => {
+  const OLD = process.env
+  beforeAll(() => {
+    process.env = {
+      ...OLD,
+      MEDUSA_SALES_CHANNEL_ID: MARKETPLACE,
+      MEDUSA_MX_OPERATING_CHANNEL_ID: OPERATING,
+    } as any
+  })
+  afterAll(() => { process.env = OLD })
+
+  const MX_SELLER = {
+    id: 'sel_1',
+    slug: 'miel-verduras',
+    status: 'active',
+    metadata: { operating_market: 'mx' },
+  }
+
+  it('returns seller.slug with an admission', async () => {
+    const { res, out } = fakeRes()
+    await GET({ params: { id: 'prod_1' }, query: { market: 'mx' }, scope: scopeWithOwner(MX_SELLER) } as any, res)
+    expect(out.status).toBe(200)
+    expect(out.body.admitted).toBe(true)
+    expect(out.body.seller).toEqual({ slug: 'miel-verduras' })
+  })
+
+  it('a refusal never names the owner (uniform 404)', async () => {
+    const { res, out } = fakeRes()
+    await GET(
+      { params: { id: 'prod_1' }, query: { market: 'mx' }, scope: scopeWithOwner({ ...MX_SELLER, status: 'paused' }) } as any,
+      res,
+    )
+    expect(out.status).toBe(404)
+    expect(JSON.stringify(out.body)).not.toContain('miel-verduras')
+  })
+})
