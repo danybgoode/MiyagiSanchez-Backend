@@ -32,7 +32,7 @@ import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } f
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
-import { OFFER_SESSION_TTL_MS, claimOfferForCheckout, keepOfferReserved, releaseOfferClaim, supabaseOfferKeep, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
+import { OFFER_SESSION_TTL_MS, claimOfferForCheckout, releaseOfferClaim, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
 import { checkFulfillmentMethod, sellerShippingInput } from '../../../../../lib/fulfillment-method-guard'
 import { correosGate } from '../../../../../lib/correos-gate'
 import { checkItemAmount } from '../../../../../lib/zero-amount-guard'
@@ -656,7 +656,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
     // CLAIM (validate → claim → apply): one accepted offer opens one checkout at a time.
     if (decision.amountCents !== undefined && decision.offerId) {
-      const claimed = await claimOfferForCheckout(decision.offerId, new Date(), supabaseOfferClaim(supabaseRead as any))
+      const claimed = await claimOfferForCheckout(decision.offerId, new Date(), supabaseOfferClaim(supabaseRead as any), { permanent: isManual })
       if (!claimed.ok) return res.status(claimed.status).json({ code: claimed.code, message: claimed.message })
       // Any refusal or error after this point, before a payment session is returned, frees the
       // offer again. A 2xx means a session exists and the reservation stays until it goes stale.
@@ -1555,12 +1555,6 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         const closed = closedRefusal(now_ ? derivePaymentLinkState(now_, new Date()) : 'cancelled')
         return res.status(closed?.status ?? 410).json({ code: closed?.code ?? 'LINK_CLOSED', message: closed?.message ?? 'Este cobro ya no está disponible.' })
       }
-    }
-
-    // A manual offer order has no session to expire, so its reservation must not go stale and
-    // let a second checkout re-open the offer. Stripe/MP offers keep the short reservation.
-    if (isManual && offerReservation) {
-      await keepOfferReserved(offerReservation.offerId, offerReservation.reservedAt, supabaseOfferKeep(supabaseRead as any))
     }
 
     const responseBody: Record<string, unknown> = {

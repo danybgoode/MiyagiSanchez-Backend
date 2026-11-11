@@ -167,25 +167,34 @@ export const OFFER_IN_CHECKOUT_MESSAGE =
 export const OFFER_RESERVATION_PERMANENT_ISO = '9999-12-31T00:00:00.000Z'
 
 /** Resolves true when this caller won the reservation. A THROW = the claim could not be made. */
-export type OfferClaim = (offerId: string, nowIso: string, staleBeforeIso: string) => Promise<boolean>
+/** `writeIso` is the value stored in checkout_reserved_at; `nowIso` is for the offer-expiry condition. */
+export type OfferClaim = (offerId: string, writeIso: string, staleBeforeIso: string, nowIso: string) => Promise<boolean>
 export type OfferRelease = (offerId: string, reservedAtIso: string) => Promise<void>
 
 export type OfferClaimDecision =
   | { ok: true; reservedAt: string }
   | { ok: false; status: 409 | 503; code: 'OFFER_IN_CHECKOUT' | 'OFFER_UNAVAILABLE'; message: string }
 
-export async function claimOfferForCheckout(offerId: string, now: Date, claim: OfferClaim): Promise<OfferClaimDecision> {
+/**
+ * `permanent` is for a MANUAL-payment checkout: its order is created immediately and there is no
+ * session to expire, so the reservation is CLAIMED with the far-future timestamp up front. (A
+ * second write after the order existed could fail or match nothing and silently leave the offer
+ * re-checkable-out after the stale window.) The release-on-failure hook keys on the value written,
+ * so a manual checkout that fails still frees the offer.
+ */
+export async function claimOfferForCheckout(offerId: string, now: Date, claim: OfferClaim, opts: { permanent?: boolean } = {}): Promise<OfferClaimDecision> {
   const nowIso = now.toISOString()
+  const writeIso = opts.permanent ? OFFER_RESERVATION_PERMANENT_ISO : nowIso
   const staleBeforeIso = new Date(now.getTime() - OFFER_RESERVATION_STALE_MS).toISOString()
   let won: boolean
   try {
-    won = await claim(offerId, nowIso, staleBeforeIso)
+    won = await claim(offerId, writeIso, staleBeforeIso, nowIso)
   } catch {
     // Could not claim is NOT "free to pay": never let a checkout through unclaimed.
     return { ok: false, status: 503, code: 'OFFER_UNAVAILABLE', message: OFFER_UNAVAILABLE_MESSAGE }
   }
   if (!won) return { ok: false, status: 409, code: 'OFFER_IN_CHECKOUT', message: OFFER_IN_CHECKOUT_MESSAGE }
-  return { ok: true, reservedAt: nowIso }
+  return { ok: true, reservedAt: writeIso }
 }
 
 /** Best-effort: a failed release only means the 30-minute stale window frees the offer instead. */
@@ -204,41 +213,17 @@ export async function releaseOfferClaim(
   }
 }
 
-/** After a MANUAL offer order exists: the reservation never goes stale. Best-effort, logged. */
-export async function keepOfferReserved(
-  offerId: string,
-  reservedAt: string,
-  keep: (offerId: string, reservedAtIso: string, permanentIso: string) => Promise<void>,
-  log: (msg: string) => void = (m) => console.error(m),
-): Promise<boolean> {
-  try {
-    await keep(offerId, reservedAt, OFFER_RESERVATION_PERMANENT_ISO)
-    return true
-  } catch (e) {
-    log(`[offer-checkout] could not keep offer ${offerId} reserved: ${e instanceof Error ? e.message : String(e)}`)
-    return false
-  }
-}
-
-export function supabaseOfferKeep(supabase: { from: (t: string) => any }) {
-  return async (offerId: string, reservedAtIso: string, permanentIso: string) => {
-    const { error } = await supabase
-      .from('marketplace_offers')
-      .update({ checkout_reserved_at: permanentIso })
-      .eq('id', offerId)
-      .eq('checkout_reserved_at', reservedAtIso)
-    if (error) throw new Error(error.message ?? 'offer keep failed')
-  }
-}
-
 export function supabaseOfferClaim(supabase: { from: (t: string) => any }): OfferClaim {
-  return async (offerId, nowIso, staleBeforeIso) => {
+  return async (offerId, writeIso, staleBeforeIso, nowIso) => {
     const { data, error } = await supabase
       .from('marketplace_offers')
-      .update({ checkout_reserved_at: nowIso })
+      .update({ checkout_reserved_at: writeIso })
       .eq('id', offerId)
       .eq('status', 'accepted')
       .or(`checkout_reserved_at.is.null,checkout_reserved_at.lt.${staleBeforeIso}`)
+      // An expired payment window cannot be reserved. NULL is legitimate (a seller without Stripe has
+      // no window — offer-respond.ts initialises it null), so null stays claimable.
+      .or(`checkout_expires_at.is.null,checkout_expires_at.gt.${nowIso}`)
       .select('id')
     if (error) throw new Error(error.message ?? 'offer claim failed')
     return Array.isArray(data) && data.length > 0

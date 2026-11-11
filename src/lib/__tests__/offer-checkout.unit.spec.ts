@@ -1,4 +1,4 @@
-import { claimOfferForCheckout, releaseOfferClaim, OFFER_RESERVATION_STALE_MS, OFFER_IN_CHECKOUT_MESSAGE, OFFER_SESSION_TTL_MS, OFFER_RESERVATION_PERMANENT_ISO, keepOfferReserved, resolveOfferCheckout, type OfferRecord, type OfferCheckoutInput } from '../offer-checkout'
+import { claimOfferForCheckout, releaseOfferClaim, OFFER_RESERVATION_STALE_MS, OFFER_IN_CHECKOUT_MESSAGE, OFFER_SESSION_TTL_MS, OFFER_RESERVATION_PERMANENT_ISO, supabaseOfferClaim, resolveOfferCheckout, type OfferRecord, type OfferCheckoutInput } from '../offer-checkout'
 
 /**
  * The offer-amount tamper guarantee: a checkout charges a negotiated price only when it is a
@@ -91,8 +91,8 @@ describe('resolveOfferCheckout', () => {
 describe('claimOfferForCheckout', () => {
   const fakeStore = (reservedAt: string | null) => {
     const state = { reservedAt }
-    const claim = async (_id: string, nowIso: string, staleBeforeIso: string) => {
-      if (state.reservedAt === null || state.reservedAt < staleBeforeIso) { state.reservedAt = nowIso; return true }
+    const claim = async (_id: string, writeIso: string, staleBeforeIso: string) => {
+      if (state.reservedAt === null || state.reservedAt < staleBeforeIso) { state.reservedAt = writeIso; return true }
       return false
     }
     return { state, claim }
@@ -143,15 +143,44 @@ describe('offer reservation vs payment session', () => {
     expect(OFFER_SESSION_TTL_MS).toBeGreaterThan(30 * 60 * 1000)
     expect(OFFER_RESERVATION_STALE_MS).toBe(OFFER_SESSION_TTL_MS + 5 * 60 * 1000)
   })
-  it('keeping a manual offer reserved writes a far-future timestamp over OUR reservation only', async () => {
-    const calls: string[][] = []
-    expect(await keepOfferReserved('off_1', 't1', async (...a) => { calls.push(a) })).toBe(true)
-    expect(calls).toEqual([['off_1', 't1', OFFER_RESERVATION_PERMANENT_ISO]])
+  it('a MANUAL checkout claims with the far-future timestamp up front, never a second write', async () => {
+    const written: string[] = []
+    const r = await claimOfferForCheckout('off_1', NOW, async (_id, writeIso) => { written.push(writeIso); return true }, { permanent: true })
+    expect(written).toEqual([OFFER_RESERVATION_PERMANENT_ISO])
+    expect(r).toEqual({ ok: true, reservedAt: OFFER_RESERVATION_PERMANENT_ISO })
     expect(Date.parse(OFFER_RESERVATION_PERMANENT_ISO)).toBeGreaterThan(Date.now() + 365 * 24 * 3600 * 1000)
   })
-  it('a failed keep is logged, not thrown', async () => {
-    const logs: string[] = []
-    expect(await keepOfferReserved('off_1', 't1', async () => { throw new Error('x') }, (m) => logs.push(m))).toBe(false)
-    expect(logs[0]).toContain('off_1')
+  it('Stripe/MP claims write now()', async () => {
+    const written: string[] = []
+    await claimOfferForCheckout('off_1', NOW, async (_id, writeIso) => { written.push(writeIso); return true })
+    expect(written).toEqual([NOW.toISOString()])
+  })
+  it('a failed manual checkout releases the permanent reservation using the value written', async () => {
+    const r = await claimOfferForCheckout('off_1', NOW, async () => true, { permanent: true })
+    const calls: string[][] = []
+    if (r.ok) await releaseOfferClaim('off_1', r.reservedAt, async (id, t) => { calls.push([id, t]) })
+    expect(calls).toEqual([['off_1', OFFER_RESERVATION_PERMANENT_ISO]])
+  })
+})
+
+describe('supabaseOfferClaim conditions', () => {
+  const recorder = () => {
+    const calls: Array<[string, ...unknown[]]> = []
+    const q: any = new Proxy({}, { get: (_t, name: string) => {
+      if (name === 'then') return (res: any) => res({ data: [{ id: 'off_1' }], error: null })
+      return (...a: unknown[]) => { calls.push([name, ...a]); return q }
+    } })
+    return { calls, db: { from: () => q } }
+  }
+  it('requires accepted, a free-or-stale reservation, and an unexpired (or absent) payment window', async () => {
+    const { calls, db } = recorder()
+    expect(await supabaseOfferClaim(db)('off_1', 'W', 'STALE', 'NOW')).toBe(true)
+    const ors = calls.filter(([n]) => n === 'or').map(([, f]) => f)
+    expect(ors).toEqual([
+      'checkout_reserved_at.is.null,checkout_reserved_at.lt.STALE',
+      'checkout_expires_at.is.null,checkout_expires_at.gt.NOW',
+    ])
+    expect(calls).toContainEqual(['eq', 'status', 'accepted'])
+    expect(calls).toContainEqual(['update', { checkout_reserved_at: 'W' }])
   })
 })
