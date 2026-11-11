@@ -21,6 +21,8 @@ import {
 } from '@medusajs/medusa/core-flows'
 import {
   isStockableListingType,
+  validateSeatQuantity,
+  ensureSalesChannelLocationLink,
   resolveStockLocationId,
   setVariantAvailableQuantity,
   getProductAvailableQuantity,
@@ -400,6 +402,34 @@ export async function updateSellerProduct(
         status: 503,
         message: `No stock location is configured for market "${sellerMarketForWrite}". Refusing before product update.`,
       }
+    }
+  }
+
+  // ── VALIDATE A STOCK WRITE BEFORE ANY WRITE (event seats, S1.1) ──────────────
+  // "Only physical products / events can carry a quantity" and "seats are never negative"
+  // used to be checked in the stock section at the bottom, AFTER title/attrs were already
+  // persisted — a 422 that had in fact partly written (the exact trap the block below
+  // describes). Both are pure given the product's type + attrs, so they go first.
+  if (body.quantity !== undefined && body.quantity !== null) {
+    const { data: stockRows } = await remoteQuery.graph({
+      entity: 'product',
+      fields: ['metadata', 'type.value'],
+      filters: { id },
+    })
+    const stockProduct = stockRows?.[0] as any
+    const stockType = stockProduct?.type?.value ?? (stockProduct?.metadata?.listing_type as string | undefined) ?? 'product'
+    // An event's block can arrive in this same request or already sit on the listing.
+    const stockAttrs = {
+      ...((stockProduct?.metadata?.attrs as Record<string, unknown> | undefined) ?? {}),
+      ...(body.attrs ?? {}),
+    }
+    // ONE predicate with create: physical products, or an event (block + quantity).
+    if (!isStockableListingType(stockType, { attrs: stockAttrs, quantity: body.quantity })) {
+      return { ok: false, status: 422, message: 'Only physical products can have a stock quantity' }
+    }
+    if (stockType !== 'product') {
+      const seats = validateSeatQuantity(body.quantity)
+      if (!seats.ok) return { ok: false, status: 422, message: seats.message }
     }
   }
 
@@ -983,6 +1013,7 @@ export async function updateSellerProduct(
       fields: [
         'metadata', 'type.value',
         'variants.id', 'variants.sku', 'variants.title', 'variants.manage_inventory',
+        'sales_channels.id',
       ],
       filters: { id },
     })
@@ -995,15 +1026,24 @@ export async function updateSellerProduct(
       | { id: string; sku?: string | null; title?: string | null; manage_inventory?: boolean }
       | undefined
 
-    if (!isStockableListingType(listingType)) {
-      return { ok: false, status: 422, message: 'Only physical products can have a stock quantity' }
-    }
+    // The stockable-type and negative-seat refusals ran BEFORE the first write (see the
+    // pre-write block above); by here the request is already known to be admissible.
     if (!variant && variants.length > 1) {
       return { ok: false, status: 422, message: 'Este producto tiene varias variantes; especifica variant_id.' }
     }
     if (variant) {
       const locationId = inventoryLocationForWrite!
       if (locationId) {
+        // An event listing (created before seats existed, or half-provisioned by a failed
+        // earlier attempt) may have channels not linked to the stock location; without the
+        // link reserveInventoryStep fails at checkout with "sales channel not associated".
+        // The link is idempotent, so it runs on EVERY event seat write, before the flip: a
+        // retry after a partial failure repairs it instead of skipping it (codex review #230).
+        if (listingType !== 'product') {
+          for (const ch of (product?.sales_channels ?? []) as Array<{ id?: string }>) {
+            if (ch?.id) await ensureSalesChannelLocationLink(scope, ch.id, locationId)
+          }
+        }
         if (!variant.manage_inventory) {
           await (productService as any).updateProductVariants(variant.id, { manage_inventory: true })
         }
