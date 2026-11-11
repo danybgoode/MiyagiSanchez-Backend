@@ -26,6 +26,7 @@ import { enviaKillGate, ENVIA_ARRANGED_DELIVERY_MESSAGE } from '../../../../lib/
 import { correosGate } from '../../../../lib/correos-gate'
 import { quoteCorreosForPieces } from '../../../../lib/correos-tariff'
 import { resolveSellerProductIds } from '../../_utils/seller-catalog-query'
+import { shippingQuoteKey, signShippingRate } from '../../../../lib/shipping-quote-signature'
 
 const DEFAULT_CARRIERS = ['dhl', 'fedex', 'estafeta', 'ups', 'redpack', 'paquetexpress']
 
@@ -236,6 +237,22 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     return res.status(422).json({ error: 'Ningún artículo requiere envío por paquetería.' })
   }
 
+  // Every rate leaves this route SIGNED (lib/shipping-quote-signature.ts): start-checkout charges a
+  // shipping price only when the signature verifies, so the amount cannot be named by the caller.
+  // Bound to the products asked about + the destination postcode (no cart exists yet at quote time).
+  // No usable server secret => no signature => checkout refuses the rate (fails closed).
+  const quoteKey = shippingQuoteKey(process.env)
+  const nowMs = Date.now()
+  const signRates = <T extends NormalizedRate>(rates: T[]) => rates.map((r) => ({
+    ...r,
+    signature: signShippingRate(
+      quoteKey,
+      { rate_id: r.rateId, carrier: r.carrier, service: r.service, amount_cents: r.amountCents, currency: r.currency },
+      { productIds: listingIds, postalCode: body.address?.postal_code },
+      nowMs,
+    ),
+  }))
+
   const pkgDefaults = shipping.package_defaults ?? {}
   const handlingFeeCents = Math.max(0, Math.round(shipping.handling_fee_cents ?? 0))
   const rateDisplay = shipping.rate_display ?? 'recommended'
@@ -297,7 +314,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   if (enviaBlocked) {
     return res.json(
       correosRate
-        ? { rates: [correosRate], package_count: packages.length }
+        ? { rates: signRates([correosRate]), package_count: packages.length }
         : { rates: [], package_count: packages.length, message: ENVIA_ARRANGED_DELIVERY_MESSAGE },
     )
   }
@@ -373,7 +390,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     if (normalized.length === 0) {
       return res.json(
         correosRate
-          ? { rates: [correosRate], package_count: packages.length }
+          ? { rates: signRates([correosRate]), package_count: packages.length }
           : { rates: [], package_count: packages.length, message: ENVIA_ARRANGED_DELIVERY_MESSAGE },
       )
     }
@@ -386,7 +403,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
     const finalRates = correosRate ? [...visible, correosRate] : visible
 
-    return res.json({ rates: finalRates, package_count: packages.length })
+    return res.json({ rates: signRates(finalRates), package_count: packages.length })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[envia/rates] quote failed:', msg)

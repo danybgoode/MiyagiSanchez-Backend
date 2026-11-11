@@ -33,6 +33,7 @@ import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/co
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
 import { resolveOfferCheckout, supabaseOfferLookup } from '../../../../../lib/offer-checkout'
+import { checkShippingQuote, shippingQuoteKey } from '../../../../../lib/shipping-quote-signature'
 import { supabaseRead } from '../../../_utils/supabase-read'
 import { resolveRentalCheckout, type RentalBooking } from '../../../../../lib/rental-checkout'
 import {
@@ -136,6 +137,8 @@ type CheckoutShippingQuote = {
   currency?: string
   delivery_estimate?: number | null
   delivery_label?: string | null
+  /** Issued by /store/envia/rates — a quote without a valid one is not charged. */
+  signature?: string
 }
 
 function medusaAddress(input?: CheckoutShippingAddress | null) {
@@ -779,6 +782,23 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const rawItemsCents = rentalBooking?.total_cents ?? supportCheckout?.amount_cents ?? body.offer_amount_cents ?? (Math.round(Number(cart.total ?? 0)) || itemsTotalCents)
   const shippingQuote = normalizeShippingQuote(body.shipping_quote)
   const shippingCents = shippingQuote?.amount_cents ?? 0
+  // A shipping price is charged ONLY when this server quoted it (lib/shipping-quote-signature.ts).
+  // The amount used to be charged as the body named it. Validation only — nothing is written yet.
+  if (shippingQuote) {
+    const quoteCheck = checkShippingQuote(
+      shippingQuoteKey(process.env),
+      body.shipping_quote as any,
+      {
+        productIds: (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id),
+        postalCode: body.shipping_address?.postal_code,
+      },
+      Date.now(),
+    )
+    if (!quoteCheck.ok) {
+      console.warn(`[start-checkout] shipping quote refused (${quoteCheck.reason}) cart=${cartId}`)
+      return res.status(quoteCheck.status).json({ message: quoteCheck.message, code: quoteCheck.code })
+    }
+  }
   // priceCents and checkoutTotalCents are finalized after bundle discount is resolved below
 
   if (!seller) {
