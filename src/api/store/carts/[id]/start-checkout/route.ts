@@ -28,10 +28,12 @@ import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
 import { isCoordinatedListing, type DeliveryMode } from '../../../_utils/delivery-catalog'
 import { isEnabled } from '../../../../../lib/flags'
-import { extractClerkUserId, resolveOrCreateBuyerCustomer } from '../../../_utils/clerk-auth'
+import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } from '../../../_utils/clerk-auth'
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
+import { resolveOfferCheckout, supabaseOfferLookup } from '../../../../../lib/offer-checkout'
+import { supabaseRead } from '../../../_utils/supabase-read'
 import { resolveRentalCheckout, type RentalBooking } from '../../../../../lib/rental-checkout'
 import {
   readStripePaymentContext,
@@ -617,6 +619,31 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     body.offer_amount_cents = undefined
     body.offer_id = undefined
     body.coupon_code = undefined
+  }
+
+  // ── Negotiated price must be a REAL accepted offer ────────────────────────
+  // `offer_amount_cents` used to be charged as sent. It is now honoured only when
+  // `offer_id` names an accepted, unexpired offer for THIS cart's single listing at
+  // exactly that amount, for this buyer (lib/offer-checkout.ts). Anything else is refused,
+  // never silently repriced.
+  {
+    const decision = await resolveOfferCheckout(
+      {
+        offerAmountCents: body.offer_amount_cents,
+        offerId: body.offer_id,
+        cartItems: (cart.items ?? []) as any[],
+        clerkUserId: extractClerkUserId(req),
+        buyerEmails: [(cart as any).email, body.buyer_email, extractClerkEmail(req)],
+        now: new Date(),
+      },
+      supabaseOfferLookup(supabaseRead as any),
+    )
+    if (!decision.ok) {
+      return res.status(decision.status).json({ code: decision.code, message: decision.message })
+    }
+    body.offer_amount_cents = decision.amountCents
+    // A bare offer_id with no amount is not proof of anything — do not stamp it on the order.
+    if (decision.amountCents === undefined) body.offer_id = undefined
   }
 
   const item = cart.items[0] as any
