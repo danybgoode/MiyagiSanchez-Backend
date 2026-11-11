@@ -138,26 +138,60 @@ export function eventSeatsSuite(getContainer: () => any) {
 
     // Reserve-at-COMPLETION is where the engine actually takes the seats: adding to a cart
     // reserves nothing. Same shape as the in-person suite's payCart (cash provider).
-    async function buy(container: any, productId: string, variantId: string, quantity: number): Promise<'completed' | string> {
+    // Split in two so a test can ADD for several buyers first and COMPLETE them afterwards.
+    async function prepareCart(container: any, productId: string, variantId: string, quantity: number): Promise<string> {
       const { result: cart } = await createCartWorkflow(container).run({
         input: { region_id: regionId, sales_channel_id: channelId, currency_code: 'mxn', shipping_address: { country_code: 'mx', first_name: 'A', last_name: 'B', address_1: 'x', city: 'x', postal_code: '1' } as any },
       })
+      await addToCartWorkflow(container).run({ input: { cart_id: cart.id, items: [{ variant_id: variantId, quantity }] } })
+      await container.resolve(Modules.CART).addShippingMethods(cart.id, [{
+        name: 'Entregado en persona', amount: 0,
+        shipping_option_id: await optionForProduct(container, cart.id, productId), data: {},
+      }])
+      const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cart.id } })
+      await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
+        provider_id: 'pp_cash_cash', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
+      })
+      return cart.id
+    }
+
+    async function complete(container: any, cartId: string): Promise<'completed' | string> {
       try {
-        await addToCartWorkflow(container).run({ input: { cart_id: cart.id, items: [{ variant_id: variantId, quantity }] } })
-        await container.resolve(Modules.CART).addShippingMethods(cart.id, [{
-          name: 'Entregado en persona', amount: 0,
-          shipping_option_id: await optionForProduct(container, cart.id, productId), data: {},
-        }])
-        const { result: pc } = await createPaymentCollectionForCartWorkflow(container).run({ input: { cart_id: cart.id } })
-        await container.resolve(Modules.PAYMENT).createPaymentSession((pc as any).id, {
-          provider_id: 'pp_cash_cash', data: {}, amount: (pc as any).amount, currency_code: 'mxn', context: {},
-        })
-        await completeCartWorkflow(container).run({ input: { id: cart.id } })
+        await completeCartWorkflow(container).run({ input: { id: cartId } })
         return 'completed'
       } catch (e) {
         return `refused: ${(e as Error).message}`
       }
     }
+
+    async function buy(container: any, productId: string, variantId: string, quantity: number): Promise<'completed' | string> {
+      try {
+        return await complete(container, await prepareCart(container, productId, variantId, quantity))
+      } catch (e) {
+        return `refused: ${(e as Error).message}`
+      }
+    }
+
+    it('the real race: Cupo 2, A and B each ADD 2 while seats are free; A completes, B is refused by the reservation', async () => {
+      const container = getContainer()
+      const created = await createSellerProduct(container, sellerId, {
+        title: 'Carrera por el cupo', listing_type: 'service', price_cents: 15000, quantity: 2, attrs: EVENT,
+      })
+      const productId = (created as { product_id: string }).product_id
+      const variantId = (await productView(container, productId)).variants[0].id
+
+      // Both adds succeed: nothing is reserved until completion, so each cart sees 2 free seats.
+      const cartA = await prepareCart(container, productId, variantId, 2)
+      const cartB = await prepareCart(container, productId, variantId, 2)
+      expect((await productView(container, productId)).available).toBe(2)
+
+      expect(await complete(container, cartA)).toBe('completed')
+      expect((await productView(container, productId)).available).toBe(0)
+
+      // reserveInventoryStep → the inventory module: NOT_ALLOWED «Not enough stock available for item …».
+      expect(await complete(container, cartB)).toMatch(/^refused: .*Not enough stock/)
+      expect((await productView(container, productId)).available).toBe(0)   // B took nothing
+    })
 
     it('Cupo 2, buyer A completes 2 tickets: buyer B cannot add or complete even 1 (cross-buyer oversell)', async () => {
       const container = getContainer()
