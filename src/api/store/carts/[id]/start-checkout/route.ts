@@ -33,6 +33,7 @@ import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/co
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
 import { resolveOfferCheckout, supabaseOfferLookup } from '../../../../../lib/offer-checkout'
+import { checkItemAmount } from '../../../../../lib/zero-amount-guard'
 import { checkShippingQuote, shippingQuoteKey } from '../../../../../lib/shipping-quote-signature'
 import { supabaseRead } from '../../../_utils/supabase-read'
 import { resolveRentalCheckout, type RentalBooking } from '../../../../../lib/rental-checkout'
@@ -903,6 +904,10 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // priceCents = item charge after discounts (providers bill this); checkoutTotalCents adds shipping
   const priceCents = Math.max(0, rawItemsCents - bundleDiscountCents - couponDiscountCents)
   const checkoutTotalCents = priceCents + shippingCents
+
+  // Refuse a $0 item charge, judged on the FINAL amount after offer/support/rental/coupon/bundle.
+  const zero = checkItemAmount(priceCents, serverCartSource)
+  if (!zero.ok) return res.status(zero.status).json({ message: zero.message, code: zero.code })
 
   // ── Escrow mode is resolved early so it can be written to cart metadata before the payment branch
   const checkoutSettings = (sellerSettings.checkout ?? {}) as Record<string, unknown>
