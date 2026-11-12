@@ -41,7 +41,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const remoteQuery = req.scope.resolve('remoteQuery')
   const { data: rows } = await remoteQuery.graph({
     entity: 'product',
-    fields: ['id', 'variants.id', 'variants.title', 'variants.metadata'],
+    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata'],
     filters: { id },
   })
   const variants = (((rows?.[0] as any)?.variants ?? []) as any[]).map((v) => {
@@ -57,7 +57,26 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       ml_price_cents: typeof mlPrice === 'number' && Number.isInteger(mlPrice) && mlPrice >= 0 ? mlPrice : null,
     }
   })
-  res.json({ product_id: id, variants })
+  res.json({ product_id: id, variants, ...listingSaleFacts((rows?.[0] as any)?.metadata, (rows?.[0] as any)?.type?.value) })
+}
+
+/**
+ * The two product facts the storefront's activation gate needs, for a product in ANY status (listing-readiness S1.2).
+ * The gate used to read `/store/listings/:id`, which only returns PUBLISHED products — so activating a draft (the
+ * one case it exists for) got a 404 and failed open. Only these two keys: the rest of the metadata bag stays out.
+ */
+export function listingSaleFacts(
+  metadata: unknown,
+  productType?: unknown,
+): { listing_type: string; delivery_mode: 'carrier' | 'arranged' | null } {
+  const meta = metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata as Record<string, unknown> : {}
+  // Same precedence as the public listing shape (`_utils/listing.ts` toListingShape): the Medusa product TYPE first,
+  // then the metadata key — so the gate classifies a product exactly as every buyer surface does.
+  const type = typeof productType === 'string' && productType
+    ? productType
+    : typeof meta.listing_type === 'string' && meta.listing_type ? meta.listing_type : 'product'
+  const mode = meta.delivery_mode === 'carrier' || meta.delivery_mode === 'arranged' ? meta.delivery_mode : null
+  return { listing_type: type, delivery_mode: mode }
 }
 
 // PATCH /store/sellers/me/products/:id — update title, description, price, status
