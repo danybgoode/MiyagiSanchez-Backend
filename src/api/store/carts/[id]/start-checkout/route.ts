@@ -32,7 +32,11 @@ import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } f
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
 import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
-import { resolveOfferCheckout, supabaseOfferLookup } from '../../../../../lib/offer-checkout'
+import { OFFER_SESSION_TTL_MS, claimOfferForCheckout, releaseOfferClaim, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
+import { checkFulfillmentMethod, sellerShippingInput } from '../../../../../lib/fulfillment-method-guard'
+import { correosGate } from '../../../../../lib/correos-gate'
+import { checkItemAmount } from '../../../../../lib/zero-amount-guard'
+import { checkShippingQuote, shippingQuoteKey } from '../../../../../lib/shipping-quote-signature'
 import { supabaseRead } from '../../../_utils/supabase-read'
 import { resolveRentalCheckout, type RentalBooking } from '../../../../../lib/rental-checkout'
 import {
@@ -136,6 +140,8 @@ type CheckoutShippingQuote = {
   currency?: string
   delivery_estimate?: number | null
   delivery_label?: string | null
+  /** Issued by /store/envia/rates — a quote without a valid one is not charged. */
+  signature?: string
 }
 
 function medusaAddress(input?: CheckoutShippingAddress | null) {
@@ -621,6 +627,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     body.coupon_code = undefined
   }
 
+  // Set when this request reserved an accepted offer (S1.3); used to keep it reserved for a manual order.
+  let offerReservation: { offerId: string; reservedAt: string } | null = null
+
   // ── Negotiated price must be a REAL accepted offer ────────────────────────
   // `offer_amount_cents` used to be charged as sent. It is now honoured only when
   // `offer_id` names an accepted, unexpired offer for THIS cart's single listing at
@@ -644,6 +653,21 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     body.offer_amount_cents = decision.amountCents
     // A bare offer_id with no amount is not proof of anything — do not stamp it on the order.
     if (decision.amountCents === undefined) body.offer_id = undefined
+
+    // CLAIM (validate → claim → apply): one accepted offer opens one checkout at a time.
+    if (decision.amountCents !== undefined && decision.offerId) {
+      const claimed = await claimOfferForCheckout(decision.offerId, new Date(), supabaseOfferClaim(supabaseRead as any), { permanent: isManual })
+      if (!claimed.ok) return res.status(claimed.status).json({ code: claimed.code, message: claimed.message })
+      // Any refusal or error after this point, before a payment session is returned, frees the
+      // offer again. A 2xx means a session exists and the reservation stays until it goes stale.
+      const claimedOfferId = decision.offerId
+      offerReservation = { offerId: claimedOfferId, reservedAt: claimed.reservedAt }
+      res.on('finish', () => {
+        if (res.statusCode >= 400) {
+          void releaseOfferClaim(claimedOfferId, claimed.reservedAt, supabaseOfferRelease(supabaseRead as any))
+        }
+      })
+    }
   }
 
   const item = cart.items[0] as any
@@ -779,6 +803,23 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const rawItemsCents = rentalBooking?.total_cents ?? supportCheckout?.amount_cents ?? body.offer_amount_cents ?? (Math.round(Number(cart.total ?? 0)) || itemsTotalCents)
   const shippingQuote = normalizeShippingQuote(body.shipping_quote)
   const shippingCents = shippingQuote?.amount_cents ?? 0
+  // A shipping price is charged ONLY when this server quoted it (lib/shipping-quote-signature.ts).
+  // The amount used to be charged as the body named it. Validation only — nothing is written yet.
+  if (shippingQuote) {
+    const quoteCheck = checkShippingQuote(
+      shippingQuoteKey(process.env),
+      body.shipping_quote as any,
+      {
+        productIds: (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id),
+        postalCode: body.shipping_address?.postal_code,
+      },
+      Date.now(),
+    )
+    if (!quoteCheck.ok) {
+      console.warn(`[start-checkout] shipping quote refused (${quoteCheck.reason}) cart=${cartId}`)
+      return res.status(quoteCheck.status).json({ message: quoteCheck.message, code: quoteCheck.code })
+    }
+  }
   // priceCents and checkoutTotalCents are finalized after bundle discount is resolved below
 
   if (!seller) {
@@ -821,6 +862,39 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const fulfillmentMethod = supportCheckout ? 'digital' : (body.fulfillment_method ?? 'none')
   if (fulfillmentMethod === 'shipping' && !shippingQuote) {
     return res.status(400).json({ message: 'Selecciona una tarifa de envío para continuar.' })
+  }
+
+  // The delivery method must be one this listing + seller really offer (the same builder that
+  // makes the buyer's choices). Support carts are 'digital' by construction and server-built
+  // carts set their own method above, so neither is checked against the body.
+  if (!supportCheckout && !serverCartSource) {
+    const guardIds = Array.from(new Set(
+      (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id).filter(Boolean),
+    )) as string[]
+    const guardRows = guardIds.length ? await loadProductsForCheckout(remoteQuery as any, guardIds) : []
+    const hydrated = guardIds.length > 0 && (guardRows as any[]).length >= guardIds.length
+    const correosEligible = !correosGate({
+      correosEnabled: await isEnabled('shipping.correos_enabled'),
+      sellerOptIn: (((sellerSettings.shipping ?? {}) as any).correos_enabled) === true,
+    }).blocked
+    const methodDecision = checkFulfillmentMethod({
+      method: fulfillmentMethod,
+      products: hydrated
+        ? (guardRows as any[]).map((p) => {
+            const meta = (p?.metadata ?? {}) as Record<string, unknown>
+            return {
+              listingType: ((p?.type?.value as string | undefined) ?? (meta.listing_type as string | undefined) ?? 'product'),
+              deliveryMode: meta.delivery_mode === 'arranged' ? 'arranged' as const : 'carrier' as const,
+            }
+          })
+        : null,
+      seller: sellerShippingInput(sellerMeta, correosEligible),
+      arrangedOnlyEnabled: await isEnabled('shipping.arranged_only_enabled'),
+      market: readSellerOperatingMarket(seller).market === 'us' ? 'us' : 'mx',
+    })
+    if (!methodDecision.ok) {
+      return res.status(methodDecision.status).json({ message: methodDecision.message, code: methodDecision.code })
+    }
   }
 
   // ── US delivery admission (D16) ───────────────────────────────────────────
@@ -883,6 +957,10 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // priceCents = item charge after discounts (providers bill this); checkoutTotalCents adds shipping
   const priceCents = Math.max(0, rawItemsCents - bundleDiscountCents - couponDiscountCents)
   const checkoutTotalCents = priceCents + shippingCents
+
+  // Refuse a $0 item charge, judged on the FINAL amount after offer/support/rental/coupon/bundle.
+  const zero = checkItemAmount(priceCents, serverCartSource, couponDiscountCents, rawItemsCents - bundleDiscountCents)
+  if (!zero.ok) return res.status(zero.status).json({ message: zero.message, code: zero.code })
 
   // ── Escrow mode is resolved early so it can be written to cart metadata before the payment branch
   const checkoutSettings = (sellerSettings.checkout ?? {}) as Record<string, unknown>
@@ -1152,7 +1230,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     const session = await stripeClient.checkout.sessions.create({
       mode: 'payment',
       // D8: just over Stripe's 30-minute minimum (see COUNTER_CHECKOUT_TTL_MS).
-      ...(serverCartSource ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) } : {}),
+      // An offer checkout gets a short session too (OFFER_SESSION_TTL_MS), so its reservation can expire.
+      ...(serverCartSource ? { expires_at: Math.floor((Date.now() + COUNTER_CHECKOUT_TTL_MS) / 1000) }
+        : offerReservation ? { expires_at: Math.floor((Date.now() + OFFER_SESSION_TTL_MS) / 1000) } : {}),
       line_items: lineItems,
       // MX: transfer_data + application_fee_amount (destination charge, platform context).
       // US: empty — a direct charge carries no transfer and no application fee; the
@@ -1289,6 +1369,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       ...(serverCartSource ? {
         expires: true,
         expiration_date_to: new Date(Date.now() + COUNTER_CHECKOUT_TTL_MS).toISOString(),
+      } : offerReservation ? {
+        expires: true,
+        expiration_date_to: new Date(Date.now() + OFFER_SESSION_TTL_MS).toISOString(),
       } : {}),
       metadata: {
         cart_id: cartId,
