@@ -13,6 +13,10 @@ describe('listingSaleFacts', () => {
     expect(listingSaleFacts(null)).toEqual({ listing_type: 'product', delivery_mode: null })
     expect(listingSaleFacts({ delivery_mode: 'teleport' })).toEqual({ listing_type: 'product', delivery_mode: null })
   })
+  it('the Medusa product type wins over the metadata key, as on the public listing shape', () => {
+    expect(listingSaleFacts({ listing_type: 'product' }, 'service').listing_type).toBe('service')
+    expect(listingSaleFacts({ listing_type: 'rental' }, null).listing_type).toBe('rental')
+  })
   it('never echoes the rest of the metadata bag', () => {
     expect(Object.keys(listingSaleFacts({ listing_type: 'product', secret: 'x' })).sort()).toEqual(['delivery_mode', 'listing_type'])
   })
