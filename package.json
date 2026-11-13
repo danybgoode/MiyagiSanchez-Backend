@@ -39,9 +39,9 @@
     "@medusajs/payment-stripe": "^2.19.0",
     "@medusajs/ui": "4.2.13",
     "@medusajs/workflow-engine-redis": "^2.19.0",
-    "@supabase/supabase-js": "^2.118.0",
-    "@tanstack/react-query": "5.105.3",
-    "jose": "^6.2.15",
+    "@supabase/supabase-js": "^2.119.0",
+    "@tanstack/react-query": "5.107.1",
+    "jose": "^6.2.17",
     "react-i18next": "13.5.0",
     "react-router": "7.18.2",
     "react-router-dom": "7.18.5",
@@ -50,7 +50,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@medusajs/test-utils": "^2.22.6",
-    "@swc/core": "^1.16.21",
+    "@swc/core": "^1.16.22",
     "@swc/jest": "^0.2.36",
     "@types/jest": "^29.5.13",
     "@types/js-yaml": "^4.0.9",
@@ -66,8 +66,8 @@
     "react-hook-form": "7.91.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.6.2",
-    "typescript-eslint": "^8.72.1",
-    "vite": "7.3.7",
+    "typescript-eslint": "^8.72.2",
+    "vite": "7.3.8",
     "yalc": "^1.0.0-pre.53"
   },
   "engines": {
