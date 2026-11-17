@@ -84,10 +84,9 @@ export async function resolveOfferCheckout(
 
   if (offer.status !== 'accepted') return invalid()
 
-  // A NULL checkout_expires_at is legitimate, not a gap: the storefront leaves it null when the seller
-  // has no Stripe account to open a payment window on (apps/storefront/lib/offer-respond.ts:298 initialises
-  // `checkoutExpires = null` and sets it only inside the Stripe-enabled branch, ~line 328). Such an offer
-  // has no payment deadline to enforce here, so we do not refuse it.
+  // Every offer accepted since 2026-11-17 has a 24h window (storefront lib/offers.ts offerPaymentDeadline,
+  // written in the accepting update; Storefront #506). A NULL checkout_expires_at is still legitimate: offers
+  // accepted earlier at a shop without Stripe never got one, and they have no deadline to enforce here.
   if (offer.checkout_expires_at) {
     const exp = Date.parse(offer.checkout_expires_at)
     if (!Number.isFinite(exp) || exp <= input.now.getTime()) return invalid()
@@ -221,8 +220,8 @@ export function supabaseOfferClaim(supabase: { from: (t: string) => any }): Offe
       .eq('id', offerId)
       .eq('status', 'accepted')
       .or(`checkout_reserved_at.is.null,checkout_reserved_at.lt.${staleBeforeIso}`)
-      // An expired payment window cannot be reserved. NULL is legitimate (a seller without Stripe has
-      // no window — offer-respond.ts initialises it null), so null stays claimable.
+      // An expired payment window cannot be reserved. NULL stays claimable: offers accepted before
+      // 2026-11-17 at a shop without Stripe have no window (see resolveOfferCheckout above).
       .or(`checkout_expires_at.is.null,checkout_expires_at.gt.${nowIso}`)
       .select('id')
     if (error) throw new Error(error.message ?? 'offer claim failed')
