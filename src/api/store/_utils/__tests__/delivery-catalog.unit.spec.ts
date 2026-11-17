@@ -1,4 +1,4 @@
-import { buildDeliveryCatalog, isCoordinatedListing, resolveDeliveryModeForWrite } from '../delivery-catalog'
+import { buildDeliveryCatalog, earlyCoordinatedRefusal, isCoordinatedListing, resolveDeliveryModeForWrite } from '../delivery-catalog'
 
 /**
  * Arranged-only delivery · Sprint 1 · S1.1 (backend enforcement).
@@ -237,5 +237,39 @@ describe('isSeatedEvent · a ticket is an event block AND seats (security lens o
   it('seats without an event block is not an event', () => {
     expect(isSeatedEvent({ metadata: { attrs: {} }, variants: seated })).toBe(false)
     expect(isSeatedEvent(null)).toBe(false)
+  })
+})
+
+describe('start-checkout, BOTH guards together: a seated Evento by card with fulfillment_method service (fresh review, PR 237)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isSeatedEvent } = require('../inventory') as typeof import('../inventory')
+  const ticket = { metadata: { attrs: { event_date: '2026-12-01' } }, variants: [{ manage_inventory: true }] }
+  const plain = { metadata: { attrs: {} }, variants: [{ manage_inventory: false }] }
+  const coordinated = (p: { metadata: { attrs: Record<string, unknown> }; variants: Array<{ manage_inventory: boolean }> }) =>
+    isCoordinatedListing({ listingType: 'service', deliveryMode: 'carrier', arrangedOnlyEnabled: true, isDigital: false, isEvent: isSeatedEvent(p) })
+
+  it('🚨 a card ticket passes the early pre-check AND the product guard — it used to die at the early one', () => {
+    expect(earlyCoordinatedRefusal('service', false)).toBe(false)
+    expect(coordinated(ticket)).toBe(false)
+  })
+  it('the negation: a plain service by card still fails the authoritative product guard', () => {
+    expect(earlyCoordinatedRefusal('service', false)).toBe(false)
+    expect(coordinated(plain)).toBe(true)
+  })
+  it('the early pre-check still refuses the manual-only methods by card, and never a manual payment', () => {
+    for (const m of ['none', 'coord', 'rental']) {
+      expect(earlyCoordinatedRefusal(m, false)).toBe(true)
+      expect(earlyCoordinatedRefusal(m, true)).toBe(false)
+    }
+    expect(earlyCoordinatedRefusal('shipping', false)).toBe(false)
+  })
+  it('the route uses the extracted pre-check (no inline list that could re-add service)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { join } = require('node:path') as typeof import('node:path')
+    const route = readFileSync(join(__dirname, '../../carts/[id]/start-checkout/route.ts'), 'utf8')
+    expect(route).toContain('if (earlyCoordinatedRefusal(fulfillmentMethodEarly, isManual)) {')
+    expect(route).not.toMatch(/fulfillmentMethodEarly === 'service'/)
   })
 })

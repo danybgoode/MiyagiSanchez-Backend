@@ -26,7 +26,7 @@ import { derivePaymentLinkState } from '../../../../../lib/payment-link'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
-import { isCoordinatedListing, type DeliveryMode } from '../../../_utils/delivery-catalog'
+import { earlyCoordinatedRefusal, isCoordinatedListing, type DeliveryMode } from '../../../_utils/delivery-catalog'
 import { isSeatedEvent } from '../../../_utils/inventory'
 import { isEnabled } from '../../../../../lib/flags'
 import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } from '../../../_utils/clerk-auth'
@@ -421,11 +421,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // actual items are loaded.
   const COORD_MESSAGE = 'Este vendedor coordina la entrega personalmente. El pago debe acordarse junto con la entrega — usa pago directo (SPEI / efectivo).'
   const fulfillmentMethodEarly = supportCheckout ? 'digital' : (body.fulfillment_method ?? 'none')
-  if (
-    (fulfillmentMethodEarly === 'none' || fulfillmentMethodEarly === 'coord' ||
-     fulfillmentMethodEarly === 'service' || fulfillmentMethodEarly === 'rental') &&
-    !isManual
-  ) {
+  // `service` is not in the early list (a seated Evento's only method): the product guard below decides it.
+  if (earlyCoordinatedRefusal(fulfillmentMethodEarly, isManual)) {
     return res.status(422).json({ message: COORD_MESSAGE })
   }
 

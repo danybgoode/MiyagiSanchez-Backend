@@ -118,6 +118,20 @@ const COORD_NOTE = 'Coordinas fecha, lugar y pago directamente con el vendedor.'
  * two: either rentals stay manual-only (retire the card-rental branch) or
  * this function needs a carve-out for a rental with a valid server quote.
  */
+/**
+ * start-checkout's CHEAP, client-trusting pre-check: delivery methods that can only be paid manually, refused before
+ * any DB call. NOT authoritative — the product-derived `isCoordinatedListing` guard runs after the cart loads.
+ *
+ * `service` is deliberately NOT here (coordinated-sales-readiness, fresh review on PR 237): a seated Evento's only
+ * delivery method is `service`, so listing it refused every card ticket before the product guard could exempt it. A
+ * plain service paid by card is still refused — by the authoritative guard, which reads the product.
+ */
+export const EARLY_MANUAL_ONLY_METHODS: ReadonlySet<string> = new Set(['none', 'coord', 'rental'])
+
+export function earlyCoordinatedRefusal(fulfillmentMethod: string, isManual: boolean): boolean {
+  return EARLY_MANUAL_ONLY_METHODS.has(fulfillmentMethod) && !isManual
+}
+
 export function isCoordinatedListing(input: {
   listingType: string
   deliveryMode: DeliveryMode
