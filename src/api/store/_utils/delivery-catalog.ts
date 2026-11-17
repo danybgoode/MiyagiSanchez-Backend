@@ -76,6 +76,8 @@ export interface BuildDeliveryCatalogInput {
   localPickup: boolean
   pickupSpots: PickupSpot[]
   hasLiveShipping: boolean
+  /** The product is an event (see `isCoordinatedListing`). Display-only here; start-checkout re-derives it. */
+  isEvent?: boolean
   /**
    * The SELLER's operating market, never a caller-supplied one. Defaults to `mx` so
    * every existing call site keeps today's behaviour byte-for-byte.
@@ -116,14 +118,36 @@ const COORD_NOTE = 'Coordinas fecha, lugar y pago directamente con el vendedor.'
  * two: either rentals stay manual-only (retire the card-rental branch) or
  * this function needs a carve-out for a rental with a valid server quote.
  */
+/**
+ * start-checkout's CHEAP, client-trusting pre-check: delivery methods that can only be paid manually, refused before
+ * any DB call. NOT authoritative — the product-derived `isCoordinatedListing` guard runs after the cart loads.
+ *
+ * `service` is deliberately NOT here (coordinated-sales-readiness, fresh review on PR 237): a seated Evento's only
+ * delivery method is `service`, so listing it refused every card ticket before the product guard could exempt it. A
+ * plain service paid by card is still refused — by the authoritative guard, which reads the product.
+ */
+export const EARLY_MANUAL_ONLY_METHODS: ReadonlySet<string> = new Set(['none', 'coord', 'rental'])
+
+export function earlyCoordinatedRefusal(fulfillmentMethod: string, isManual: boolean): boolean {
+  return EARLY_MANUAL_ONLY_METHODS.has(fulfillmentMethod) && !isManual
+}
+
 export function isCoordinatedListing(input: {
   listingType: string
   deliveryMode: DeliveryMode
   arrangedOnlyEnabled: boolean
   isDigital: boolean
+  /**
+   * The product carries an event block (`hasEventBlock` — a date or a venue). An EVENT TICKET is not a coordinated
+   * sale: the venue and date are fixed and a ticket is minted per unit, so there is nothing to coordinate and any rail
+   * pays (Daniel, 2026-11-16, epic coordinated-sales-readiness D1). Since the 11-11 Evento preset stores paid events
+   * as `service`, this used to refuse every card/MP ticket. Plain services and rentals stay manual-only.
+   */
+  isEvent?: boolean
 }): boolean {
   const { listingType, deliveryMode, arrangedOnlyEnabled, isDigital } = input
   if (isDigital) return false
+  if (listingType === 'service' && input.isEvent === true) return false
   if (listingType === 'service' || listingType === 'rental') return true
   return deliveryMode === 'arranged' && arrangedOnlyEnabled
 }
@@ -181,7 +205,7 @@ export function buildDeliveryCatalog(input: BuildDeliveryCatalogInput): Delivery
   // method entries further down, independent of this flag.
   const effectiveArranged = deliveryMode === 'arranged' && arrangedOnlyEnabled && !isDigital
   // Drives `onlyCoordinated` (payment filtering) — the canonical, broader signal.
-  const onlyCoordinated = isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled, isDigital })
+  const onlyCoordinated = isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled, isDigital, isEvent: input.isEvent })
 
   const deliveryMethods: DeliveryMethod[] = []
 

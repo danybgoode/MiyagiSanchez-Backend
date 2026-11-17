@@ -35,6 +35,21 @@ export function hasEventBlock(attrs: Record<string, unknown> | null | undefined)
 }
 
 /**
+ * Is this product a SEATED event — an event block AND capped seats on every variant («Lugares disponibles», no backorder)? That is what a
+ * ticket is, and only a ticket skips the coordinated-sale rule (coordinated-sales-readiness D1). An event block with no
+ * seat limit stays coordinated: card payments with unmanaged stock could sell more tickets than the venue holds
+ * (security lens on PR 237). The Evento preset always sets seats, so a real ticket always qualifies.
+ */
+export function isSeatedEvent(product: { metadata?: unknown; variants?: unknown } | null | undefined): boolean {
+  const meta = product?.metadata && typeof product.metadata === 'object' ? product.metadata as Record<string, unknown> : {}
+  if (!hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined)) return false
+  // CAPPED stock on EVERY variant: managed AND not backorderable — a backorder variant keeps manage_inventory but can
+  // reserve past its seats, so card sales could oversell (security lens on PR 237, second pass).
+  const variants = Array.isArray(product?.variants) ? product!.variants as Array<{ manage_inventory?: unknown; allow_backorder?: unknown }> : []
+  return variants.length > 0 && variants.every((v) => v?.manage_inventory === true && v?.allow_backorder !== true)
+}
+
+/**
  * The ONE stock predicate — create, update and the backfill all ask it.
  *
  * Physical `product` listings are unique-stock items (covers autos/inmuebles,

@@ -1,4 +1,4 @@
-import { buildDeliveryCatalog, isCoordinatedListing, resolveDeliveryModeForWrite } from '../delivery-catalog'
+import { buildDeliveryCatalog, earlyCoordinatedRefusal, isCoordinatedListing, resolveDeliveryModeForWrite } from '../delivery-catalog'
 
 /**
  * Arranged-only delivery · Sprint 1 · S1.1 (backend enforcement).
@@ -179,5 +179,97 @@ describe('resolveDeliveryModeForWrite', () => {
   it('forces rental listings to arranged regardless of what was requested', () => {
     expect(resolveDeliveryModeForWrite({ listingType: 'rental', requested: 'carrier' })).toEqual({ ok: true, value: 'arranged' })
     expect(resolveDeliveryModeForWrite({ listingType: 'rental', requested: null })).toEqual({ ok: true, value: 'arranged' })
+  })
+})
+
+describe('isCoordinatedListing · an event ticket is not a coordinated sale (coordinated-sales-readiness D1, 2026-11-16)', () => {
+  const base = { deliveryMode: 'carrier' as const, arrangedOnlyEnabled: true, isDigital: false }
+  it('🚨 a paid Evento (a service with an event block) takes any rail — it used to refuse every card ticket', () => {
+    expect(isCoordinatedListing({ ...base, listingType: 'service', isEvent: true })).toBe(false)
+  })
+  it('the negation: a plain service and a rental stay manual-only, event flag or not', () => {
+    expect(isCoordinatedListing({ ...base, listingType: 'service', isEvent: false })).toBe(true)
+    expect(isCoordinatedListing({ ...base, listingType: 'service' })).toBe(true)
+    expect(isCoordinatedListing({ ...base, listingType: 'rental', isEvent: true })).toBe(true)
+  })
+  it('an arranged product stays coordinated even if it somehow carries an event block', () => {
+    expect(isCoordinatedListing({ ...base, listingType: 'product', deliveryMode: 'arranged', isEvent: true })).toBe(true)
+  })
+  it('the catalog stops filtering to manual rails for an event', () => {
+    const shared = { isDigital: false, deliveryMode: 'carrier' as const, arrangedOnlyEnabled: true, localPickup: false, pickupSpots: [], hasLiveShipping: false }
+    expect(buildDeliveryCatalog({ ...shared, listingType: 'service', isEvent: true }).onlyCoordinated).toBe(false)
+    expect(buildDeliveryCatalog({ ...shared, listingType: 'service' }).onlyCoordinated).toBe(true)
+  })
+})
+
+describe('start-checkout derives "is an event" from the PRODUCT, never the client (coordinated-sales-readiness D1)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { readFileSync } = require('node:fs') as typeof import('node:fs')
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { join } = require('node:path') as typeof import('node:path')
+  const route = readFileSync(join(__dirname, '../../carts/[id]/start-checkout/route.ts'), 'utf8')
+  it('the COORD guard and the fulfillment guard both read isSeatedEvent(product)', () => {
+    expect(route).toContain('const isEvent = isSeatedEvent(p)')
+    expect(route).toContain('arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem, isEvent })')
+    expect(route).toContain('isEvent: isSeatedEvent(p),')
+    expect(route).toContain("fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory', 'variants.allow_backorder'],")
+    expect(route).not.toMatch(/req\.body[^\n]*is_event|body\.is_event/)
+  })
+})
+
+describe('isSeatedEvent · a ticket is an event block AND seats (security lens on PR 237)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isSeatedEvent } = require('../inventory') as typeof import('../inventory')
+  const seated = [{ manage_inventory: true }]
+  it('an event with seats is a ticket', () => {
+    expect(isSeatedEvent({ metadata: { attrs: { event_date: '2026-12-01' } }, variants: seated })).toBe(true)
+  })
+  it('🚨 an event block with NO seat limit is not — card payments could oversell the venue', () => {
+    expect(isSeatedEvent({ metadata: { attrs: { venue_name: 'Teatro' } }, variants: [{ manage_inventory: false }] })).toBe(false)
+    expect(isSeatedEvent({ metadata: { attrs: { venue_name: 'Teatro' } } })).toBe(false)
+  })
+  it('🚨 a BACKORDER variant is not capped seats — it could reserve past the venue (security lens, second pass)', () => {
+    const ev = { metadata: { attrs: { event_date: '2026-12-01' } } }
+    expect(isSeatedEvent({ ...ev, variants: [{ manage_inventory: true, allow_backorder: true }] })).toBe(false)
+    expect(isSeatedEvent({ ...ev, variants: [{ manage_inventory: true }, { manage_inventory: false }] })).toBe(false)
+    expect(isSeatedEvent({ ...ev, variants: [] })).toBe(false)
+  })
+  it('seats without an event block is not an event', () => {
+    expect(isSeatedEvent({ metadata: { attrs: {} }, variants: seated })).toBe(false)
+    expect(isSeatedEvent(null)).toBe(false)
+  })
+})
+
+describe('start-checkout, BOTH guards together: a seated Evento by card with fulfillment_method service (fresh review, PR 237)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isSeatedEvent } = require('../inventory') as typeof import('../inventory')
+  const ticket = { metadata: { attrs: { event_date: '2026-12-01' } }, variants: [{ manage_inventory: true }] }
+  const plain = { metadata: { attrs: {} }, variants: [{ manage_inventory: false }] }
+  const coordinated = (p: { metadata: { attrs: Record<string, unknown> }; variants: Array<{ manage_inventory: boolean }> }) =>
+    isCoordinatedListing({ listingType: 'service', deliveryMode: 'carrier', arrangedOnlyEnabled: true, isDigital: false, isEvent: isSeatedEvent(p) })
+
+  it('🚨 a card ticket passes the early pre-check AND the product guard — it used to die at the early one', () => {
+    expect(earlyCoordinatedRefusal('service', false)).toBe(false)
+    expect(coordinated(ticket)).toBe(false)
+  })
+  it('the negation: a plain service by card still fails the authoritative product guard', () => {
+    expect(earlyCoordinatedRefusal('service', false)).toBe(false)
+    expect(coordinated(plain)).toBe(true)
+  })
+  it('the early pre-check still refuses the manual-only methods by card, and never a manual payment', () => {
+    for (const m of ['none', 'coord', 'rental']) {
+      expect(earlyCoordinatedRefusal(m, false)).toBe(true)
+      expect(earlyCoordinatedRefusal(m, true)).toBe(false)
+    }
+    expect(earlyCoordinatedRefusal('shipping', false)).toBe(false)
+  })
+  it('the route uses the extracted pre-check (no inline list that could re-add service)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { join } = require('node:path') as typeof import('node:path')
+    const route = readFileSync(join(__dirname, '../../carts/[id]/start-checkout/route.ts'), 'utf8')
+    expect(route).toContain('if (earlyCoordinatedRefusal(fulfillmentMethodEarly, isManual)) {')
+    expect(route).not.toMatch(/fulfillmentMethodEarly === 'service'/)
   })
 })

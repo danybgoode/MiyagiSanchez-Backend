@@ -26,7 +26,8 @@ import { derivePaymentLinkState } from '../../../../../lib/payment-link'
 import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
-import { isCoordinatedListing, type DeliveryMode } from '../../../_utils/delivery-catalog'
+import { earlyCoordinatedRefusal, isCoordinatedListing, type DeliveryMode } from '../../../_utils/delivery-catalog'
+import { isSeatedEvent } from '../../../_utils/inventory'
 import { isEnabled } from '../../../../../lib/flags'
 import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } from '../../../_utils/clerk-auth'
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
@@ -215,7 +216,8 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
   if (typeof remoteQuery?.graph === 'function') {
     const { data: rows } = await remoteQuery.graph({
       entity: 'product',
-      fields: ['id', 'metadata', 'type.value'],
+      // variants.manage_inventory: a ticket is a SEATED event (isSeatedEvent) — coordinated-sales-readiness.
+      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory', 'variants.allow_backorder'],
       filters: { id: productIds },
     })
     return rows ?? []
@@ -223,7 +225,8 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
 
   const { data: rows } = await remoteQuery({
     product: {
-      fields: ['id', 'metadata', 'type.value'],
+      // variants.manage_inventory: a ticket is a SEATED event (isSeatedEvent) — coordinated-sales-readiness.
+      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory', 'variants.allow_backorder'],
       variables: { filters: { id: productIds } },
     },
   })
@@ -418,11 +421,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   // actual items are loaded.
   const COORD_MESSAGE = 'Este vendedor coordina la entrega personalmente. El pago debe acordarse junto con la entrega — usa pago directo (SPEI / efectivo).'
   const fulfillmentMethodEarly = supportCheckout ? 'digital' : (body.fulfillment_method ?? 'none')
-  if (
-    (fulfillmentMethodEarly === 'none' || fulfillmentMethodEarly === 'coord' ||
-     fulfillmentMethodEarly === 'service' || fulfillmentMethodEarly === 'rental') &&
-    !isManual
-  ) {
+  // `service` is not in the early list (a seated Evento's only method): the product guard below decides it.
+  if (earlyCoordinatedRefusal(fulfillmentMethodEarly, isManual)) {
     return res.status(422).json({ message: COORD_MESSAGE })
   }
 
@@ -712,7 +712,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       const listingType = (p?.type?.value as string | undefined) ?? (meta.listing_type as string | undefined) ?? 'product'
       const deliveryMode: DeliveryMode = meta.delivery_mode === 'arranged' ? 'arranged' : 'carrier'
       const isDigitalItem = listingType === 'digital' || listingType === 'print_ad'
-      return isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem })
+      // Read from the PRODUCT (never the client): a seated event ticket is not a coordinated sale (D1, 2026-11-16).
+      const isEvent = isSeatedEvent(p)
+      return isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem, isEvent })
     })
     // A counter sale hands the goods over in person, so "delivery is coordinated" has
     // nothing left to coordinate — card by QR is exactly the point (D8).
@@ -885,6 +887,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
             return {
               listingType: ((p?.type?.value as string | undefined) ?? (meta.listing_type as string | undefined) ?? 'product'),
               deliveryMode: meta.delivery_mode === 'arranged' ? 'arranged' as const : 'carrier' as const,
+              isEvent: isSeatedEvent(p),
             }
           })
         : null,

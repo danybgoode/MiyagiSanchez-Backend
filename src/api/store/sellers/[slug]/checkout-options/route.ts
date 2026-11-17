@@ -87,6 +87,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   // so card/manual checkout works and the coord-only rule never trips.
   const isDigital = req.query.is_digital === 'true' || listingType === 'digital' || listingType === 'print_ad'
   const deliveryMode = req.query.delivery_mode === 'arranged' ? 'arranged' as const : 'carrier' as const
+  // A display hint, like listing_type: start-checkout re-derives "is this an event" from the product itself.
+  const isEvent = req.query.is_event === 'true'
 
   const settings = ((seller.metadata ?? {}) as any).settings ?? {}
   const shipping = (settings.shipping ?? {}) as Record<string, any>
@@ -128,6 +130,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const { deliveryMethods: delivery_methods, onlyCoordinated } = buildDeliveryCatalog({
     listingType,
     isDigital,
+    isEvent,
     deliveryMode,
     arrangedOnlyEnabled,
     localPickup,
