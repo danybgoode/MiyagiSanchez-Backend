@@ -32,7 +32,7 @@ import { isEnabled } from '../../../../../lib/flags'
 import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } from '../../../_utils/clerk-auth'
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
 import { isSupportProductMetadata, normalizeSupportCheckout, type NormalizedSupportCheckout } from '../../../_utils/support'
-import { resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
+import { linkedOwners, productOwnerIds, resolveSellerForCheckout } from '../../../_utils/support-seller-resolution'
 import { OFFER_SESSION_TTL_MS, claimOfferForCheckout, releaseOfferClaim, resolveOfferCheckout, supabaseOfferClaim, supabaseOfferLookup, supabaseOfferRelease } from '../../../../../lib/offer-checkout'
 import { checkFulfillmentMethod, sellerShippingInput } from '../../../../../lib/fulfillment-method-guard'
 import { correosGate } from '../../../../../lib/correos-gate'
@@ -761,13 +761,26 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   }
 
   // ── Find seller for this product ──────────────────────────────────────────
+  // Who owns each product in the cart decides who may be paid for it (Backend #238). One shop per
+  // checkout: a cart holding two shops' products is refused, never paid to whichever came first.
+  // Support checkouts name their seller in the product's metadata and are not owner-checked here.
+  const cartProductIdsForSeller = Array.from(new Set(
+    (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id).filter(Boolean),
+  )) as string[]
+  const productOwners = supportCheckout ? undefined : await productOwnerIds(remoteQuery as any, cartProductIdsForSeller)
+  if (productOwners && linkedOwners(productOwners).length > 1) {
+    return res.status(409).json({
+      code: 'CART_MIXED_SELLERS',
+      message: 'Este carrito tiene productos de dos tiendas. Paga cada tienda por separado.',
+    })
+  }
+
   const seller = await resolveSellerForCheckout({
     sellerService,
     remoteQuery,
     productId,
-    cartProductIds: Array.from(new Set(
-      (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id).filter(Boolean),
-    )) as string[],
+    cartProductIds: cartProductIdsForSeller,
+    productOwners,
     bodySellerId: body.seller_id,
     productMetadata,
     isSupportCheckout: !!supportCheckout,

@@ -18,15 +18,17 @@ function sellerServiceWith(sellers: Array<{ id: string }>) {
 // `remoteQuery(...)` returning `{ data }` — the shape the code expected, not the one the engine
 // returns (a bare array) — so the owner lookup passed here while finding nobody live.
 function remoteQueryWithLinks(links: Record<string, string[]>) {
+  const ownerOf = (productId: string) =>
+    Object.entries(links).find(([, ids]) => ids.includes(productId))?.[0] ?? null
   return {
-    graph: jest.fn(async (query: { entity: string; filters: { id: string } }) => {
-      const sellerId = query.filters.id
-      return {
-        data: [{
-          id: sellerId,
-          products: (links[sellerId] ?? []).map((id) => ({ id })),
-        }],
+    graph: jest.fn(async (query: { entity: string; filters: { id: string | string[] } }) => {
+      if (query.entity === 'product') {
+        const ids = ([] as string[]).concat(query.filters.id)
+        // A product with no row (unknown id) is simply absent, as from the engine.
+        return { data: ids.map((id) => ({ id, seller: ownerOf(id) ? { id: ownerOf(id) } : null })) }
       }
+      const sellerId = query.filters.id as string
+      return { data: [{ id: sellerId, products: (links[sellerId] ?? []).map((id) => ({ id })) }] }
     }),
   }
 }
@@ -102,16 +104,41 @@ describe('a caller-named seller is a hint, never who gets paid', () => {
     })).resolves.toMatchObject({ id: 'seller_owner' })
   })
 
-  it('a named shop owning only ONE of the cart\'s products is not kept', async () => {
+  it('a named shop owning only ONE of the cart\'s products is not kept, and nobody is paid', async () => {
+    // Paying the first line's owner would let the caller choose by ordering lines (codex + pr-reviewer, PR 238).
     await expect(resolveSellerForCheckout({
       sellerService: sellerServiceWith(sellers),
       remoteQuery: remoteQueryWithLinks({ seller_owner: ['prod_a'], seller_stranger: ['prod_own'] }),
-      productId: 'prod_a',
-      cartProductIds: ['prod_a', 'prod_own'],
+      productId: 'prod_own',
+      cartProductIds: ['prod_own', 'prod_a'],
       bodySellerId: 'seller_stranger',
       productMetadata: {},
       isSupportCheckout: false,
-    })).resolves.toMatchObject({ id: 'seller_owner' })
+    })).resolves.toBeNull()
+  })
+
+  it('a cart linked to two shops resolves to nobody (start-checkout refuses it)', async () => {
+    await expect(resolveSellerForCheckout({
+      sellerService: sellerServiceWith(sellers),
+      remoteQuery: remoteQueryWithLinks({ seller_owner: ['prod_a'], seller_stranger: ['prod_own'] }),
+      productId: 'prod_own',
+      cartProductIds: ['prod_own', 'prod_a'],
+      bodySellerId: undefined,
+      productMetadata: {},
+      isSupportCheckout: false,
+    })).resolves.toBeNull()
+  })
+
+  it('an unlinked product adds no constraint: the named shop is kept (today\'s behaviour)', async () => {
+    await expect(resolveSellerForCheckout({
+      sellerService: sellerServiceWith(sellers),
+      remoteQuery: remoteQueryWithLinks({}),
+      productId: 'prod_orphan',
+      cartProductIds: ['prod_orphan'],
+      bodySellerId: 'seller_stranger',
+      productMetadata: {},
+      isSupportCheckout: false,
+    })).resolves.toMatchObject({ id: 'seller_stranger' })
   })
 
   it('finds the owner when no seller is named', async () => {

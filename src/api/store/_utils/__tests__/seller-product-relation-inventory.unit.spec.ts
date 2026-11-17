@@ -12,7 +12,7 @@ const EXPECTED_MIGRATED_CALL_COUNTS: Record<string, number> = {
   'store/_utils/profit-apply-price.ts': 1,
   // Two identical metadata queries were consolidated into one typed read.
   'store/_utils/support-product-ensure.ts': 1,
-  'store/_utils/support-seller-resolution.ts': 2, // + sellerOwnsProducts (named-seller check, 2026-11-17)
+  'store/_utils/support-seller-resolution.ts': 1,
   'store/envia/rates/route.ts': 1,
   'store/home/personalization/route.ts': 1,
   'store/listings/[id]/route.ts': 1,

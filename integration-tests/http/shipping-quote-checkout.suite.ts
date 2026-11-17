@@ -104,6 +104,7 @@ export function shippingQuoteCheckoutSuite(
     let otherVariantId: string
     let sellerId: string
     let strangerId: string
+    let strangerVariantId: string
 
     async function makeProduct(container: any, sellerId: string, title: string, channelIds: string[], profileId: string) {
       const { result: [product] } = await createProductsWorkflow(container).run({
@@ -212,6 +213,8 @@ export function shippingQuoteCheckoutSuite(
       const other = await makeProduct(container, seller.id, 'Jarrón', [marketplace.id, operating.id], profile.id)
       otherProductId = other.id
       otherVariantId = other.variants[0].id
+      const strangerOwn = await makeProduct(container, stranger.id, 'Llavero ajeno', [marketplace.id, operating.id], profile.id)
+      strangerVariantId = strangerOwn.variants[0].id
     })
 
     async function quote(productIds: string[], postal = BUYER_ADDRESS.postal_code): Promise<SignedRate> {
@@ -345,6 +348,18 @@ export function shippingQuoteCheckoutSuite(
       const res = await statusOf(startCheckout(cartId, { seller_id: strangerId, shipping_quote: quoteFrom(rate) }))
       // Unconditional (codex, PR 238): a refusal must not pass this test — the owner is paid.
       expect(res).toMatchObject({ status: 200, data: { manual_payment: { spei: { clabe: OWNER_CLABE } } } })
+    })
+
+    it('a cart holding two shops\' products is refused, whichever line comes first', async () => {
+      // The receiver used to be the owner of the FIRST cart line, so a caller could put a cheap
+      // product of their own first and be paid for someone else's (codex security + pr-reviewer, PR 238).
+      const cartId = await cartWith([strangerVariantId, variantId])
+      for (const seller_id of [strangerId, sellerId, undefined]) {
+        const res = await statusOf(startCheckout(cartId, { seller_id, fulfillment_method: 'local_pickup' }))
+        expect(res).toMatchObject({ status: 409, data: { code: 'CART_MIXED_SELLERS' } })
+      }
+      const cart = await chargedOf(cartId)
+      expect(cart.payment_collection ?? null).toBeNull()
     })
 
     it('with Correos switched off the rates route quotes nothing to sign (the negation)', async () => {

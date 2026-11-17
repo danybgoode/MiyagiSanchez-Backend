@@ -10,10 +10,28 @@ export async function findSellerById(sellerService: SellerServiceLike, sellerId?
   return seller ?? null
 }
 
-/** Does this seller own every one of these products (the seller↔product link)? */
-export async function sellerOwnsProducts(remoteQuery: any, sellerId: string, productIds: string[]): Promise<boolean> {
-  const owned = await resolveSellerProductIdsFromRemoteQuery(remoteQuery, sellerId)
-  return productIds.every((id) => owned.has(id))
+/**
+ * Each product's linked seller id, or `null` when no seller is linked to it — ONE query, product
+ * side of the seller↔product link (the read checkout-admission already uses). Deliberately NOT
+ * caught: checkout decides who is paid from this, so a failed read fails the checkout closed.
+ */
+export async function productOwnerIds(
+  remoteQuery: { graph: (q: Record<string, unknown>) => Promise<{ data?: unknown[] }> },
+  productIds: string[],
+): Promise<Map<string, string | null>> {
+  const ids = Array.from(new Set(productIds.filter(Boolean)))
+  const owners = new Map<string, string | null>(ids.map((id) => [id, null]))
+  if (!ids.length) return owners
+  const { data } = await remoteQuery.graph({ entity: 'product', fields: ['id', 'seller.id'], filters: { id: ids } })
+  for (const row of (data ?? []) as Array<{ id?: string; seller?: { id?: string } | null }>) {
+    if (row?.id && owners.has(row.id)) owners.set(row.id, row.seller?.id ?? null)
+  }
+  return owners
+}
+
+/** The distinct sellers the cart's products are linked to (unlinked products contribute none). */
+export function linkedOwners(owners: Map<string, string | null>): string[] {
+  return Array.from(new Set(Array.from(owners.values()).filter((id): id is string => !!id)))
 }
 
 export async function findSellerLinkedToProduct(
@@ -49,12 +67,15 @@ export async function resolveSellerForCheckout({
   productMetadata,
   isSupportCheckout,
   cartProductIds,
+  productOwners,
 }: {
   sellerService: SellerServiceLike
   remoteQuery: any
   productId?: string | null
-  /** Every product in the cart. A caller-named seller must own all of them. Defaults to [productId]. */
+  /** Every product in the cart. Defaults to [productId]. */
   cartProductIds?: string[]
+  /** `productOwnerIds(cartProductIds)` when the caller already has it (start-checkout does). */
+  productOwners?: Map<string, string | null>
   bodySellerId?: string | null
   productMetadata: Record<string, unknown>
   isSupportCheckout: boolean
@@ -63,26 +84,22 @@ export async function resolveSellerForCheckout({
     ? await findSellerById(sellerService, supportSellerIdFromMetadata(productMetadata))
     : null
 
-  // The caller's `seller_id` is a HINT that skips the scan below — never an authority over who
-  // is paid. The seller resolved here receives the money (Stripe destination, Mercado Pago
-  // account, the CLABE shown for a transfer), so a caller who named their own shop for someone
-  // else's product used to be paid for it while the real owner saw the order (2026-11-17).
-  // A named seller is kept only when it owns every product in the cart; otherwise the product's
-  // real owner is used. When NO seller owns the product (an unlinked row), the named seller is
-  // kept as before: there is no owner to divert the money from.
-  if (!seller && bodySellerId) {
+  if (seller) return seller
+
+  // The caller's `seller_id` is a HINT that saves a lookup — never an authority over who is paid.
+  // The seller resolved here RECEIVES the money (Stripe destination, Mercado Pago account, the
+  // CLABE shown for a transfer). It used to be taken as sent, so a caller who named their own shop
+  // for someone else's product was paid for it while the real owner saw the order (2026-11-17,
+  // Backend #238). Now: a named seller is kept only when every LINKED product in the cart is its
+  // own; otherwise the cart's one linked owner is used. A cart linked to two shops resolves to
+  // nobody here and start-checkout refuses it (CART_MIXED_SELLERS). Products linked to NO seller
+  // add no constraint — today's behaviour, kept because how many such rows exist live is unmeasured.
+  const ids = (cartProductIds?.length ? cartProductIds : productId ? [productId] : []).filter(Boolean)
+  const owners = linkedOwners(productOwners ?? (await productOwnerIds(remoteQuery, ids)))
+  if (bodySellerId) {
     const named = await findSellerById(sellerService, bodySellerId)
-    const ids = (cartProductIds?.length ? cartProductIds : productId ? [productId] : []).filter(Boolean)
-    if (named && (ids.length === 0 || (await sellerOwnsProducts(remoteQuery, named.id, ids)))) {
-      seller = named
-    } else if (named) {
-      seller = (await findSellerLinkedToProduct(sellerService, remoteQuery, productId)) ?? named
-    }
+    if (named && owners.every((id) => id === named.id)) return named
   }
-
-  if (!seller) {
-    seller = await findSellerLinkedToProduct(sellerService, remoteQuery, productId)
-  }
-
+  if (owners.length === 1) seller = await findSellerById(sellerService, owners[0])
   return seller
 }
