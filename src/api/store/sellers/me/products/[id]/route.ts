@@ -6,7 +6,7 @@ import SellerModuleService from '../../../../../../modules/seller/service'
 import { extractClerkUserId } from '../../../../_utils/clerk-auth'
 import { updateSellerProduct, type SellerProductUpdateBody } from '../../../../_utils/seller-product-update'
 import { resolveSellerProductIds } from '../../../../_utils/seller-catalog-query'
-import { hasEventBlock } from '../../../../_utils/inventory'
+import { isSeatedEvent } from '../../../../_utils/inventory'
 
 async function resolveOwnership(req: MedusaRequest, productId: string) {
   const clerkUserId = extractClerkUserId(req) ?? (req as any).auth_context?.actor_id
@@ -42,7 +42,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const remoteQuery = req.scope.resolve('remoteQuery')
   const { data: rows } = await remoteQuery.graph({
     entity: 'product',
-    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata', 'variants.prices.amount'],
+    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata', 'variants.prices.amount', 'variants.manage_inventory'],
     filters: { id },
   })
   const variants = (((rows?.[0] as any)?.variants ?? []) as any[]).map((v) => {
@@ -81,7 +81,8 @@ export function listingSaleFacts(
   const mode = meta.delivery_mode === 'carrier' || meta.delivery_mode === 'arranged' ? meta.delivery_mode : null
   // coordinated-sales-readiness S1.2: the storefront gate judges a service draft by the SAME facts checkout uses —
   // is it an event (`hasEventBlock`, the seats predicate) and does it carry a positive price (else it is contact-only).
-  const isEvent = hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined)
+  // A SEATED event (isSeatedEvent): the event block and a seat-managed variant — exactly what checkout calls a ticket.
+  const isEvent = isSeatedEvent({ metadata, variants })
   const priced = Array.isArray(variants) && variants.some((v) =>
     Array.isArray(v?.prices) && v.prices.some((p: { amount?: unknown }) => typeof p?.amount === 'number' && p.amount > 0))
   return { listing_type: type, delivery_mode: mode, is_event: isEvent, priced }

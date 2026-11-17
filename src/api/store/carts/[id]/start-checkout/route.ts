@@ -27,7 +27,7 @@ import SellerModuleService from '../../../../../modules/seller/service'
 import { resolveSellerMpToken, sellerMpConnected, MP_MARKETPLACE_FEE_RATE } from '../../../_utils/mp'
 import { resolveShippingOptionIds } from '../../../_utils/fulfillment'
 import { isCoordinatedListing, type DeliveryMode } from '../../../_utils/delivery-catalog'
-import { hasEventBlock } from '../../../_utils/inventory'
+import { isSeatedEvent } from '../../../_utils/inventory'
 import { isEnabled } from '../../../../../lib/flags'
 import { extractClerkEmail, extractClerkUserId, resolveOrCreateBuyerCustomer } from '../../../_utils/clerk-auth'
 import { resolveCouponForCheckout, couponErrorMessage } from '../../../_utils/coupons'
@@ -216,7 +216,8 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
   if (typeof remoteQuery?.graph === 'function') {
     const { data: rows } = await remoteQuery.graph({
       entity: 'product',
-      fields: ['id', 'metadata', 'type.value'],
+      // variants.manage_inventory: a ticket is a SEATED event (isSeatedEvent) — coordinated-sales-readiness.
+      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory'],
       filters: { id: productIds },
     })
     return rows ?? []
@@ -224,7 +225,8 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
 
   const { data: rows } = await remoteQuery({
     product: {
-      fields: ['id', 'metadata', 'type.value'],
+      // variants.manage_inventory: a ticket is a SEATED event (isSeatedEvent) — coordinated-sales-readiness.
+      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory'],
       variables: { filters: { id: productIds } },
     },
   })
@@ -713,8 +715,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       const listingType = (p?.type?.value as string | undefined) ?? (meta.listing_type as string | undefined) ?? 'product'
       const deliveryMode: DeliveryMode = meta.delivery_mode === 'arranged' ? 'arranged' : 'carrier'
       const isDigitalItem = listingType === 'digital' || listingType === 'print_ad'
-      // Read from the PRODUCT (never the client): an event ticket is not a coordinated sale (D1, 2026-11-16).
-      const isEvent = hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined)
+      // Read from the PRODUCT (never the client): a seated event ticket is not a coordinated sale (D1, 2026-11-16).
+      const isEvent = isSeatedEvent(p)
       return isCoordinatedListing({ listingType, deliveryMode, arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem, isEvent })
     })
     // A counter sale hands the goods over in person, so "delivery is coordinated" has
@@ -888,7 +890,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
             return {
               listingType: ((p?.type?.value as string | undefined) ?? (meta.listing_type as string | undefined) ?? 'product'),
               deliveryMode: meta.delivery_mode === 'arranged' ? 'arranged' as const : 'carrier' as const,
-              isEvent: hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined),
+              isEvent: isSeatedEvent(p),
             }
           })
         : null,

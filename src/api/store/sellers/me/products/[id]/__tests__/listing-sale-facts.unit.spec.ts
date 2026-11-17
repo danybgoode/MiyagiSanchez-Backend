@@ -23,10 +23,12 @@ describe('listingSaleFacts', () => {
 })
 
 describe('listingSaleFacts · event + priced (coordinated-sales-readiness S1.2)', () => {
-  it('an event block (a date or a venue — the seats predicate) makes it an event', () => {
-    expect(listingSaleFacts({ attrs: { event_date: '2026-12-01' } }).is_event).toBe(true)
-    expect(listingSaleFacts({ attrs: { venue_name: 'Teatro' } }).is_event).toBe(true)
-    expect(listingSaleFacts({ attrs: { event_date: '  ' } }).is_event).toBe(false)
+  it('a SEATED event (event block + a seat-managed variant) is an event; no seats is not', () => {
+    const seats = [{ manage_inventory: true, prices: [] }]
+    expect(listingSaleFacts({ attrs: { event_date: '2026-12-01' } }, null, seats).is_event).toBe(true)
+    expect(listingSaleFacts({ attrs: { venue_name: 'Teatro' } }, null, seats).is_event).toBe(true)
+    expect(listingSaleFacts({ attrs: { event_date: '2026-12-01' } }).is_event).toBe(false)
+    expect(listingSaleFacts({ attrs: { event_date: '  ' } }, null, seats).is_event).toBe(false)
   })
   it('priced = a positive amount on some variant; null, 0 and missing are not', () => {
     expect(listingSaleFacts({}, null, [{ prices: [{ amount: 25000 }] }]).priced).toBe(true)

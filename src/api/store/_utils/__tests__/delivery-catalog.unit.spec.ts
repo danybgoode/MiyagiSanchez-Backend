@@ -208,10 +208,28 @@ describe('start-checkout derives "is an event" from the PRODUCT, never the clien
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { join } = require('node:path') as typeof import('node:path')
   const route = readFileSync(join(__dirname, '../../carts/[id]/start-checkout/route.ts'), 'utf8')
-  it('the COORD guard and the fulfillment guard both read hasEventBlock(meta.attrs)', () => {
-    expect(route).toContain('const isEvent = hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined)')
+  it('the COORD guard and the fulfillment guard both read isSeatedEvent(product)', () => {
+    expect(route).toContain('const isEvent = isSeatedEvent(p)')
     expect(route).toContain('arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem, isEvent })')
-    expect(route).toContain('isEvent: hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined),')
+    expect(route).toContain('isEvent: isSeatedEvent(p),')
+    expect(route).toContain("fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory'],")
     expect(route).not.toMatch(/req\.body[^\n]*is_event|body\.is_event/)
+  })
+})
+
+describe('isSeatedEvent · a ticket is an event block AND seats (security lens on PR 237)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isSeatedEvent } = require('../inventory') as typeof import('../inventory')
+  const seated = [{ manage_inventory: true }]
+  it('an event with seats is a ticket', () => {
+    expect(isSeatedEvent({ metadata: { attrs: { event_date: '2026-12-01' } }, variants: seated })).toBe(true)
+  })
+  it('🚨 an event block with NO seat limit is not — card payments could oversell the venue', () => {
+    expect(isSeatedEvent({ metadata: { attrs: { venue_name: 'Teatro' } }, variants: [{ manage_inventory: false }] })).toBe(false)
+    expect(isSeatedEvent({ metadata: { attrs: { venue_name: 'Teatro' } } })).toBe(false)
+  })
+  it('seats without an event block is not an event', () => {
+    expect(isSeatedEvent({ metadata: { attrs: {} }, variants: seated })).toBe(false)
+    expect(isSeatedEvent(null)).toBe(false)
   })
 })
