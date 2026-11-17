@@ -18,7 +18,7 @@ import { buildDeliveryCatalog, type DeliveryMode, type PickupSpot } from '../api
 
 export const FULFILLMENT_METHOD_INVALID_MESSAGE = 'Ese método de entrega no está disponible para este anuncio.'
 
-export type GuardProduct = { listingType: string; deliveryMode: DeliveryMode }
+export type GuardProduct = { listingType: string; deliveryMode: DeliveryMode; isEvent?: boolean }
 
 export type SellerShippingInput = {
   localPickup: boolean
@@ -50,6 +50,7 @@ export function checkFulfillmentMethod(input: {
     const { deliveryMethods } = buildDeliveryCatalog({
       listingType: p.listingType,
       isDigital,
+      isEvent: p.isEvent,
       deliveryMode: p.deliveryMode,
       arrangedOnlyEnabled: input.arrangedOnlyEnabled,
       localPickup: seller.localPickup,

@@ -181,3 +181,37 @@ describe('resolveDeliveryModeForWrite', () => {
     expect(resolveDeliveryModeForWrite({ listingType: 'rental', requested: null })).toEqual({ ok: true, value: 'arranged' })
   })
 })
+
+describe('isCoordinatedListing · an event ticket is not a coordinated sale (coordinated-sales-readiness D1, 2026-11-16)', () => {
+  const base = { deliveryMode: 'carrier' as const, arrangedOnlyEnabled: true, isDigital: false }
+  it('🚨 a paid Evento (a service with an event block) takes any rail — it used to refuse every card ticket', () => {
+    expect(isCoordinatedListing({ ...base, listingType: 'service', isEvent: true })).toBe(false)
+  })
+  it('the negation: a plain service and a rental stay manual-only, event flag or not', () => {
+    expect(isCoordinatedListing({ ...base, listingType: 'service', isEvent: false })).toBe(true)
+    expect(isCoordinatedListing({ ...base, listingType: 'service' })).toBe(true)
+    expect(isCoordinatedListing({ ...base, listingType: 'rental', isEvent: true })).toBe(true)
+  })
+  it('an arranged product stays coordinated even if it somehow carries an event block', () => {
+    expect(isCoordinatedListing({ ...base, listingType: 'product', deliveryMode: 'arranged', isEvent: true })).toBe(true)
+  })
+  it('the catalog stops filtering to manual rails for an event', () => {
+    const shared = { isDigital: false, deliveryMode: 'carrier' as const, arrangedOnlyEnabled: true, localPickup: false, pickupSpots: [], hasLiveShipping: false }
+    expect(buildDeliveryCatalog({ ...shared, listingType: 'service', isEvent: true }).onlyCoordinated).toBe(false)
+    expect(buildDeliveryCatalog({ ...shared, listingType: 'service' }).onlyCoordinated).toBe(true)
+  })
+})
+
+describe('start-checkout derives "is an event" from the PRODUCT, never the client (coordinated-sales-readiness D1)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { readFileSync } = require('node:fs') as typeof import('node:fs')
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { join } = require('node:path') as typeof import('node:path')
+  const route = readFileSync(join(__dirname, '../../carts/[id]/start-checkout/route.ts'), 'utf8')
+  it('the COORD guard and the fulfillment guard both read hasEventBlock(meta.attrs)', () => {
+    expect(route).toContain('const isEvent = hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined)')
+    expect(route).toContain('arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem, isEvent })')
+    expect(route).toContain('isEvent: hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined),')
+    expect(route).not.toMatch(/req\.body[^\n]*is_event|body\.is_event/)
+  })
+})

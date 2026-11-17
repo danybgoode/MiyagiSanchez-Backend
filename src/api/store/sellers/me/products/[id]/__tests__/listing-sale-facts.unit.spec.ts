@@ -7,17 +7,31 @@ import { listingSaleFacts } from '../route'
 describe('listingSaleFacts', () => {
   it('returns the type and delivery mode the gate needs', () => {
     expect(listingSaleFacts({ listing_type: 'service', delivery_mode: 'arranged', unit_cost: 5 }))
-      .toEqual({ listing_type: 'service', delivery_mode: 'arranged' })
+      .toEqual({ listing_type: 'service', delivery_mode: 'arranged', is_event: false, priced: false })
   })
   it('defaults an untyped product to product with no delivery mode', () => {
-    expect(listingSaleFacts(null)).toEqual({ listing_type: 'product', delivery_mode: null })
-    expect(listingSaleFacts({ delivery_mode: 'teleport' })).toEqual({ listing_type: 'product', delivery_mode: null })
+    expect(listingSaleFacts(null)).toEqual({ listing_type: 'product', delivery_mode: null, is_event: false, priced: false })
+    expect(listingSaleFacts({ delivery_mode: 'teleport' })).toEqual({ listing_type: 'product', delivery_mode: null, is_event: false, priced: false })
   })
   it('the Medusa product type wins over the metadata key, as on the public listing shape', () => {
     expect(listingSaleFacts({ listing_type: 'product' }, 'service').listing_type).toBe('service')
     expect(listingSaleFacts({ listing_type: 'rental' }, null).listing_type).toBe('rental')
   })
   it('never echoes the rest of the metadata bag', () => {
-    expect(Object.keys(listingSaleFacts({ listing_type: 'product', secret: 'x' })).sort()).toEqual(['delivery_mode', 'listing_type'])
+    expect(Object.keys(listingSaleFacts({ listing_type: 'product', secret: 'x' })).sort()).toEqual(['delivery_mode', 'is_event', 'listing_type', 'priced'])
+  })
+})
+
+describe('listingSaleFacts · event + priced (coordinated-sales-readiness S1.2)', () => {
+  it('an event block (a date or a venue — the seats predicate) makes it an event', () => {
+    expect(listingSaleFacts({ attrs: { event_date: '2026-12-01' } }).is_event).toBe(true)
+    expect(listingSaleFacts({ attrs: { venue_name: 'Teatro' } }).is_event).toBe(true)
+    expect(listingSaleFacts({ attrs: { event_date: '  ' } }).is_event).toBe(false)
+  })
+  it('priced = a positive amount on some variant; null, 0 and missing are not', () => {
+    expect(listingSaleFacts({}, null, [{ prices: [{ amount: 25000 }] }]).priced).toBe(true)
+    expect(listingSaleFacts({}, null, [{ prices: [{ amount: 0 }] }]).priced).toBe(false)
+    expect(listingSaleFacts({}, null, [{ prices: [] }]).priced).toBe(false)
+    expect(listingSaleFacts({}, null, undefined).priced).toBe(false)
   })
 })

@@ -6,6 +6,7 @@ import SellerModuleService from '../../../../../../modules/seller/service'
 import { extractClerkUserId } from '../../../../_utils/clerk-auth'
 import { updateSellerProduct, type SellerProductUpdateBody } from '../../../../_utils/seller-product-update'
 import { resolveSellerProductIds } from '../../../../_utils/seller-catalog-query'
+import { hasEventBlock } from '../../../../_utils/inventory'
 
 async function resolveOwnership(req: MedusaRequest, productId: string) {
   const clerkUserId = extractClerkUserId(req) ?? (req as any).auth_context?.actor_id
@@ -41,7 +42,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const remoteQuery = req.scope.resolve('remoteQuery')
   const { data: rows } = await remoteQuery.graph({
     entity: 'product',
-    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata'],
+    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata', 'variants.prices.amount'],
     filters: { id },
   })
   const variants = (((rows?.[0] as any)?.variants ?? []) as any[]).map((v) => {
@@ -57,7 +58,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       ml_price_cents: typeof mlPrice === 'number' && Number.isInteger(mlPrice) && mlPrice >= 0 ? mlPrice : null,
     }
   })
-  res.json({ product_id: id, variants, ...listingSaleFacts((rows?.[0] as any)?.metadata, (rows?.[0] as any)?.type?.value) })
+  const row = rows?.[0] as any
+  res.json({ product_id: id, variants, ...listingSaleFacts(row?.metadata, row?.type?.value, row?.variants) })
 }
 
 /**
@@ -68,7 +70,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
 export function listingSaleFacts(
   metadata: unknown,
   productType?: unknown,
-): { listing_type: string; delivery_mode: 'carrier' | 'arranged' | null } {
+  variants?: unknown,
+): { listing_type: string; delivery_mode: 'carrier' | 'arranged' | null; is_event: boolean; priced: boolean } {
   const meta = metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata as Record<string, unknown> : {}
   // Same precedence as the public listing shape (`_utils/listing.ts` toListingShape): the Medusa product TYPE first,
   // then the metadata key — so the gate classifies a product exactly as every buyer surface does.
@@ -76,7 +79,12 @@ export function listingSaleFacts(
     ? productType
     : typeof meta.listing_type === 'string' && meta.listing_type ? meta.listing_type : 'product'
   const mode = meta.delivery_mode === 'carrier' || meta.delivery_mode === 'arranged' ? meta.delivery_mode : null
-  return { listing_type: type, delivery_mode: mode }
+  // coordinated-sales-readiness S1.2: the storefront gate judges a service draft by the SAME facts checkout uses —
+  // is it an event (`hasEventBlock`, the seats predicate) and does it carry a positive price (else it is contact-only).
+  const isEvent = hasEventBlock(meta.attrs as Record<string, unknown> | null | undefined)
+  const priced = Array.isArray(variants) && variants.some((v) =>
+    Array.isArray(v?.prices) && v.prices.some((p: { amount?: unknown }) => typeof p?.amount === 'number' && p.amount > 0))
+  return { listing_type: type, delivery_mode: mode, is_event: isEvent, priced }
 }
 
 // PATCH /store/sellers/me/products/:id — update title, description, price, status
