@@ -217,7 +217,7 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
     const { data: rows } = await remoteQuery.graph({
       entity: 'product',
       // variants.manage_inventory: a ticket is a SEATED event (isSeatedEvent) — coordinated-sales-readiness.
-      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory'],
+      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory', 'variants.allow_backorder'],
       filters: { id: productIds },
     })
     return rows ?? []
@@ -226,7 +226,7 @@ async function loadProductsForCheckout(remoteQuery: any, productIds: string[]) {
   const { data: rows } = await remoteQuery({
     product: {
       // variants.manage_inventory: a ticket is a SEATED event (isSeatedEvent) — coordinated-sales-readiness.
-      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory'],
+      fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory', 'variants.allow_backorder'],
       variables: { filters: { id: productIds } },
     },
   })

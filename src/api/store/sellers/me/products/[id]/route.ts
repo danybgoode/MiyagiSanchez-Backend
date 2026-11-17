@@ -42,7 +42,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const remoteQuery = req.scope.resolve('remoteQuery')
   const { data: rows } = await remoteQuery.graph({
     entity: 'product',
-    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata', 'variants.prices.amount', 'variants.manage_inventory'],
+    fields: ['id', 'metadata', 'type.value', 'variants.id', 'variants.title', 'variants.metadata', 'variants.prices.amount', 'variants.manage_inventory', 'variants.allow_backorder'],
     filters: { id },
   })
   const variants = (((rows?.[0] as any)?.variants ?? []) as any[]).map((v) => {

@@ -212,7 +212,7 @@ describe('start-checkout derives "is an event" from the PRODUCT, never the clien
     expect(route).toContain('const isEvent = isSeatedEvent(p)')
     expect(route).toContain('arrangedOnlyEnabled: arrangedOnlyEnabledForGuard, isDigital: isDigitalItem, isEvent })')
     expect(route).toContain('isEvent: isSeatedEvent(p),')
-    expect(route).toContain("fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory'],")
+    expect(route).toContain("fields: ['id', 'metadata', 'type.value', 'variants.manage_inventory', 'variants.allow_backorder'],")
     expect(route).not.toMatch(/req\.body[^\n]*is_event|body\.is_event/)
   })
 })
@@ -227,6 +227,12 @@ describe('isSeatedEvent · a ticket is an event block AND seats (security lens o
   it('🚨 an event block with NO seat limit is not — card payments could oversell the venue', () => {
     expect(isSeatedEvent({ metadata: { attrs: { venue_name: 'Teatro' } }, variants: [{ manage_inventory: false }] })).toBe(false)
     expect(isSeatedEvent({ metadata: { attrs: { venue_name: 'Teatro' } } })).toBe(false)
+  })
+  it('🚨 a BACKORDER variant is not capped seats — it could reserve past the venue (security lens, second pass)', () => {
+    const ev = { metadata: { attrs: { event_date: '2026-12-01' } } }
+    expect(isSeatedEvent({ ...ev, variants: [{ manage_inventory: true, allow_backorder: true }] })).toBe(false)
+    expect(isSeatedEvent({ ...ev, variants: [{ manage_inventory: true }, { manage_inventory: false }] })).toBe(false)
+    expect(isSeatedEvent({ ...ev, variants: [] })).toBe(false)
   })
   it('seats without an event block is not an event', () => {
     expect(isSeatedEvent({ metadata: { attrs: {} }, variants: seated })).toBe(false)
