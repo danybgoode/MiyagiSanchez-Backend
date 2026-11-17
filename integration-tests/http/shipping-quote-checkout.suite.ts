@@ -343,8 +343,8 @@ export function shippingQuoteCheckoutSuite(
       const rate = await quote([productId])
       const cartId = await cartWith([variantId])
       const res = await statusOf(startCheckout(cartId, { seller_id: strangerId, shipping_quote: quoteFrom(rate) }))
-      expect(res.data?.manual_payment?.spei?.clabe).not.toBe(STRANGER_CLABE)
-      if (res.status === 200) expect(res.data.manual_payment.spei.clabe).toBe(OWNER_CLABE)
+      // Unconditional (codex, PR 238): a refusal must not pass this test — the owner is paid.
+      expect(res).toMatchObject({ status: 200, data: { manual_payment: { spei: { clabe: OWNER_CLABE } } } })
     })
 
     it('with Correos switched off the rates route quotes nothing to sign (the negation)', async () => {
