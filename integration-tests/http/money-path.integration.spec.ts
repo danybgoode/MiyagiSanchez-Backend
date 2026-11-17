@@ -34,6 +34,20 @@ import {
 
 import { inPersonSaleSuite } from './in-person-sale.suite'
 import { eventSeatsSuite } from './event-seats.suite'
+import { shippingQuoteCheckoutSuite } from './shipping-quote-checkout.suite'
+
+// Flags a suite forces for its own tests (cleared after each). Without Golden Frijoles in CI every
+// flag resolves to its compile default, and some money paths (Correos shipping) default OFF. The
+// app runs in this jest process, so its route modules import this mocked `isEnabled`; any flag not
+// in the map takes the real resolution chain unchanged.
+const mockFlagOverrides = new Map<string, boolean>()
+jest.mock('../../src/lib/flags', () => {
+  const actual = jest.requireActual('../../src/lib/flags')
+  return {
+    ...actual,
+    isEnabled: async (flag: string) => (mockFlagOverrides.has(flag) ? mockFlagOverrides.get(flag) : actual.isEnabled(flag)),
+  }
+})
 
 jest.setTimeout(180_000)
 
@@ -43,6 +57,8 @@ medusaIntegrationTestRunner({
     inPersonSaleSuite(getContainer, api)
     // merchant-panel-gaps S1.1 — event seats are tracked inventory the engine enforces.
     eventSeatsSuite(getContainer)
+    // checkout-trust-hardening follow-up — a signed rate is the charged rate, route to route.
+    shippingQuoteCheckoutSuite(getContainer, api, mockFlagOverrides)
 
     describe('money path — a publishable key buys exactly what it should', () => {
       let regionId: string

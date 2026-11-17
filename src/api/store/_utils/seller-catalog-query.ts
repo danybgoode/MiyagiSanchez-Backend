@@ -216,16 +216,17 @@ export async function resolveSellerProductIdsWithSlots(
  * same typed null filter rather than duplicating the unsafe map locally.
  */
 export async function resolveSellerProductIdsFromRemoteQuery(
-  remoteQuery: (query: Record<string, unknown>) => Promise<{ data?: unknown[] }>,
+  remoteQuery: GraphQueryLike,
   sellerId: string,
 ): Promise<Set<string>> {
-  const { data: rows } = await remoteQuery({
-    seller: {
-      fields: ['id', 'products.id'],
-      variables: { filters: { id: sellerId } },
-    },
-  })
-  return new Set(productRecords(rows).map((product) => product.id))
+  // `.graph`, the form every other reader here uses. This used to call the legacy
+  // `remoteQuery({ seller: … })` and destructure `{ data }` from it — but that call returns the
+  // rows as a bare array, so `data` was undefined and every seller resolved to NO products.
+  // Checkout's "who owns this product" fallback therefore never found anyone (2026-11-17,
+  // shipping-quote-checkout.suite.ts). Its unit fake returned `{ data }`, the shape the code
+  // expected, which is why nothing caught it.
+  const products = await graphSellerProductRecords(remoteQuery, sellerId, ['products.id'])
+  return new Set(products.map((product) => product.id))
 }
 
 /**

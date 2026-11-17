@@ -14,16 +14,21 @@ function sellerServiceWith(sellers: Array<{ id: string }>) {
   }
 }
 
+// The `.graph` shape the engine really answers with. The previous fake was a legacy
+// `remoteQuery(...)` returning `{ data }` — the shape the code expected, not the one the engine
+// returns (a bare array) — so the owner lookup passed here while finding nobody live.
 function remoteQueryWithLinks(links: Record<string, string[]>) {
-  return jest.fn(async (query: { seller: { variables: { filters: { id: string } } } }) => {
-    const sellerId = query.seller.variables.filters.id
-    return {
-      data: [{
-        id: sellerId,
-        products: (links[sellerId] ?? []).map((id) => ({ id })),
-      }],
-    }
-  })
+  return {
+    graph: jest.fn(async (query: { entity: string; filters: { id: string } }) => {
+      const sellerId = query.filters.id
+      return {
+        data: [{
+          id: sellerId,
+          products: (links[sellerId] ?? []).map((id) => ({ id })),
+        }],
+      }
+    }),
+  }
 }
 
 describe('resolveSellerForCheckout', () => {
@@ -67,6 +72,56 @@ describe('resolveSellerForCheckout', () => {
       productMetadata: {},
       isSupportCheckout: false,
     })).resolves.toMatchObject({ id: 'seller_fast' })
+  })
+})
+
+describe('a caller-named seller is a hint, never who gets paid', () => {
+  const sellers = [{ id: 'seller_owner' }, { id: 'seller_stranger' }]
+
+  it('keeps the named seller when it owns every product in the cart', async () => {
+    await expect(resolveSellerForCheckout({
+      sellerService: sellerServiceWith(sellers),
+      remoteQuery: remoteQueryWithLinks({ seller_owner: ['prod_a', 'prod_b'] }),
+      productId: 'prod_a',
+      cartProductIds: ['prod_a', 'prod_b'],
+      bodySellerId: 'seller_owner',
+      productMetadata: {},
+      isSupportCheckout: false,
+    })).resolves.toMatchObject({ id: 'seller_owner' })
+  })
+
+  it('pays the real owner when another shop is named for its product', async () => {
+    await expect(resolveSellerForCheckout({
+      sellerService: sellerServiceWith(sellers),
+      remoteQuery: remoteQueryWithLinks({ seller_owner: ['prod_a'], seller_stranger: ['prod_own'] }),
+      productId: 'prod_a',
+      cartProductIds: ['prod_a'],
+      bodySellerId: 'seller_stranger',
+      productMetadata: {},
+      isSupportCheckout: false,
+    })).resolves.toMatchObject({ id: 'seller_owner' })
+  })
+
+  it('a named shop owning only ONE of the cart\'s products is not kept', async () => {
+    await expect(resolveSellerForCheckout({
+      sellerService: sellerServiceWith(sellers),
+      remoteQuery: remoteQueryWithLinks({ seller_owner: ['prod_a'], seller_stranger: ['prod_own'] }),
+      productId: 'prod_a',
+      cartProductIds: ['prod_a', 'prod_own'],
+      bodySellerId: 'seller_stranger',
+      productMetadata: {},
+      isSupportCheckout: false,
+    })).resolves.toMatchObject({ id: 'seller_owner' })
+  })
+
+  it('finds the owner when no seller is named', async () => {
+    await expect(resolveSellerForCheckout({
+      sellerService: sellerServiceWith(sellers),
+      remoteQuery: remoteQueryWithLinks({ seller_owner: ['prod_a'] }),
+      productId: 'prod_a',
+      productMetadata: {},
+      isSupportCheckout: false,
+    })).resolves.toMatchObject({ id: 'seller_owner' })
   })
 })
 

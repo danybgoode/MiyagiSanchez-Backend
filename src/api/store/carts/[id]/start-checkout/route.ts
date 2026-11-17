@@ -765,6 +765,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     sellerService,
     remoteQuery,
     productId,
+    cartProductIds: Array.from(new Set(
+      (cart.items ?? []).map((i: any) => i.product_id ?? i.variant?.product_id).filter(Boolean),
+    )) as string[],
     bodySellerId: body.seller_id,
     productMetadata,
     isSupportCheckout: !!supportCheckout,
