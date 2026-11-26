@@ -68,7 +68,8 @@ jobs:
         run: gh workflow run image-arm64.yml --ref main
       - name: Say why it stopped
         if: failure()
-        run: gh pr comment "$GITHUB_REF_NAME" --body "Not merged automatically: a required check failed or the merge was refused. Waiting for Claude's review."
+        run: |
+          gh pr comment "$GITHUB_REF_NAME" --body "Not merged automatically: a required check failed or the merge was refused. Waiting for Claude's review."
 
   hold:
     needs: verify
@@ -79,4 +80,6 @@ jobs:
       GH_REPO: ${{ github.repository }}
       REASON: ${{ needs.verify.outputs.reason }}
     steps:
-      - run: gh pr comment "$GITHUB_REF_NAME" --body "Not merged automatically: $REASON. Waiting for Claude's review."
+      - name: Leave it for Claude
+        run: |
+          gh pr comment "$GITHUB_REF_NAME" --body "Not merged automatically: $REASON. Waiting for Claude's review."
