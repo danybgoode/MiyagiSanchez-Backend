@@ -1,0 +1,30 @@
+{
+ "schema": "edge-oncall/1",
+ "notes": "Rules for the VM's on-call agents in this repo (oracle-edge oncall/PROTOCOL.md). The GitHub guard reads this file from main, never from the branch it judges, and so does the VM after every sync. Recovery actions live in oracle-edge oncall/runbooks/. Auto-merge on the unit suite; money (payments, carts, checkout, webhooks, subscriptions), auth, migrations, the Medusa config and dependencies wait for review, since the money-path integration tests run only in ci.yml.",
+ "fix": {
+  "never_edit": [
+   ".github/**",
+   "ONCALL.json",
+   "Dockerfile",
+   ".dockerignore"
+  ],
+  "protected": [
+   "src/modules/payment-*",
+   "src/api/store/payments/**",
+   "src/api/store/payment-links/**",
+   "src/api/store/carts/**",
+   "src/api/store/checkout-admission/**",
+   "src/api/webhooks/**",
+   "src/modules/subscriptions/**",
+   "src/api/store/subscriptions/**",
+   "src/api/internal/*-subscription/**",
+   "src/modules/auth-clerk/**",
+   "*/migrations/*",
+   "src/migration-scripts/**",
+   "medusa-config.*",
+   "package.json",
+   "package-lock.json"
+  ],
+  "max_changed_lines": 250
+ }
+}

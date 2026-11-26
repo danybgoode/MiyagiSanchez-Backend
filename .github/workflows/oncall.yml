@@ -1,0 +1,82 @@
+name: on-call
+
+# An oncall/<incident> branch pushed by the VM's on-call agents (oracle-edge oncall/PROTOCOL.md): open a pull request,
+# run the tests, apply the guard read from main, and merge when both pass. Protected or large changes, and every PR
+# in a repo whose ONCALL.json says auto_merge false, wait for Claude. Installed from oracle-edge oncall/kit.
+#
+# A merge made with the workflow token does not start other workflows, so the merge job dispatches the image build
+# itself (image-arm64.yml); the VM then deploys main as it always does.
+on:
+  push:
+    branches: ["oncall/**"]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: oncall-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      auto_merge: ${{ steps.guard.outputs.auto_merge }}
+      reason: ${{ steps.guard.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh pr view "$GITHUB_REF_NAME" --json number >/dev/null 2>&1; then
+            git log -1 --format=%b > "$RUNNER_TEMP/body.md"
+            printf '\n---\nOpened by the VM on-call agents. Merged automatically only if the tests and the guard (run from main) pass; Claude reviews every on-call change afterwards.\n' >> "$RUNNER_TEMP/body.md"
+            gh label create oncall --color FBCA04 --description "on-call agents" 2>/dev/null || true
+            gh pr create --base main --head "$GITHUB_REF_NAME" --title "on-call: $(git log -1 --format=%s)" \
+              --body-file "$RUNNER_TEMP/body.md" --label oncall
+          fi
+      - name: Guard (from main)
+        id: guard
+        run: |
+          git show origin/main:.github/oncall_guard.py > "$RUNNER_TEMP/guard.py"
+          git show origin/main:ONCALL.json > "$RUNNER_TEMP/ONCALL.json"
+          python3 "$RUNNER_TEMP/guard.py" "$RUNNER_TEMP/ONCALL.json" origin/main HEAD | tee -a "$GITHUB_OUTPUT"
+
+  merge:
+    needs: verify
+    if: needs.verify.outputs.auto_merge == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Wait for the required checks (the repo's own CI runs on the oncall/** push)
+        run: |
+          sleep 60
+          gh pr checks "$GITHUB_REF_NAME" --required --watch --fail-fast --interval 30
+      - run: gh pr merge "$GITHUB_REF_NAME" --merge --delete-branch
+      - name: Build the image (a token merge starts no workflow on its own)
+        run: gh workflow run image-arm64.yml --ref main
+      - name: Say why it stopped
+        if: failure()
+        run: gh pr comment "$GITHUB_REF_NAME" --body "Not merged automatically: a required check failed or the merge was refused. Waiting for Claude's review."
+
+  hold:
+    needs: verify
+    if: needs.verify.outputs.auto_merge != 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      REASON: ${{ needs.verify.outputs.reason }}
+    steps:
+      - run: gh pr comment "$GITHUB_REF_NAME" --body "Not merged automatically: $REASON. Waiting for Claude's review."

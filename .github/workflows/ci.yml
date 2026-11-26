@@ -19,6 +19,11 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  # The VM's on-call agents push oncall/<incident> branches with a deploy key; their PR is opened by the workflow
+  # token, which starts no workflow, so this gate runs on the push instead and the required checks land on the same
+  # commit (oracle-edge oncall/PROTOCOL.md, 26 Nov 2026).
+  push:
+    branches: ["oncall/**"]
 
 permissions:
   contents: read
