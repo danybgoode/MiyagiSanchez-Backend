@@ -15,8 +15,8 @@ jobs:
       - name: Send Telegram notification
         shell: bash
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CICD_CHAT_ID: ${{ secrets.TELEGRAM_CICD_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DEVOPS_BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CICD_CHAT_ID: ${{ secrets.TELEGRAM_DEVOPS_CHAT_ID || secrets.TELEGRAM_CICD_CHAT_ID }}
           REPOSITORY_NAME: ${{ github.event.repository.name }}
           ACTOR_HANDLE: ${{ github.actor }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
